@@ -1,0 +1,902 @@
+{
+  "generated_utc": "2026-10-02T21:14:13Z",
+  "seed": 42,
+  "versions": {
+    "scikit_learn": "1.9.1",
+    "numpy": "2.4.6"
+  },
+  "dataset": {
+    "name": "ESA Collision Avoidance Challenge (Kelvins)",
+    "url": "https://kelvins.esa.int/collision-avoidance-challenge/",
+    "paper": "https://arxiv.org/abs/2008.03069",
+    "years": "2015\u20132019",
+    "description": "Conjunction Data Messages (CDMs) received by ESA's Space Debris Office for its satellites, anonymised.",
+    "train_events": 13154,
+    "train_events_eligible": 8892,
+    "train_high_risk_events": 93,
+    "official_test_events": 2167,
+    "official_test_high_risk_events": 150,
+    "note": "The official test set was hand-picked to over-represent high-risk events (6.9% vs ~1% in the eligible training events), so Brier scores and calibration differ between the two evaluations."
+  },
+  "task": {
+    "target": "risk (log10) in the last CDM of the event",
+    "inputs": "CDMs with time_to_tca >= 2 days only",
+    "high_risk": "final risk >= -6 (collision probability >= 1e-6)",
+    "eligibility": "training events need >= 1 CDM at >= 2 days and a final CDM within 2 days of TCA"
+  },
+  "split": {
+    "train_events": 7113,
+    "holdout_events": 1779,
+    "holdout_high_risk": 19,
+    "seed": 42
+  },
+  "models": {
+    "baseline": "Latest risk prediction: final risk = risk of the latest CDM at least 2 days from TCA; high-risk if that risk >= -6.",
+    "full": "HistGradientBoosting; isotonic-calibrated classifier (alert threshold set on out-of-fold training data to match the baseline's recall) + two regressors of the change from the latest risk: one over all events, one trained only on high-risk events and used for flagged events (shrunk toward the baseline by a cross-validated weight).",
+    "live": "Same model families restricted to the inputs our live screener produces (see feature_mapping)."
+  },
+  "thresholds": {
+    "full": 0.03935654146848177,
+    "live": 0.049990874833125885,
+    "full_f2": 0.1388,
+    "live_f2": 0.0969,
+    "rule": "primary threshold = highest value that still catches at least as many high-risk events as the baseline does (out-of-fold training recall)"
+  },
+  "hyperparameters": {
+    "full": {
+      "clf_depth": 2,
+      "clf_iters": 100,
+      "reg_depth": 4,
+      "reg_iters": 250,
+      "hr_alpha": 1.0,
+      "hr_cv_mse_by_alpha": {
+        "0.0": 0.2707943965510216,
+        "0.25": 0.24414860061715357,
+        "0.5": 0.22353569541861504,
+        "0.75": 0.20895568095540623,
+        "1.0": 0.20040855722752693
+      },
+      "hr_train_events": 74
+    },
+    "live": {
+      "clf_depth": 2,
+      "clf_iters": 100,
+      "reg_depth": 3,
+      "reg_iters": 250,
+      "hr_alpha": 1.0,
+      "hr_cv_mse_by_alpha": {
+        "0.0": 0.2707943965510216,
+        "0.25": 0.24098361221924994,
+        "0.5": 0.2204331459384597,
+        "0.75": 0.2091429977086511,
+        "1.0": 0.20711316752982406
+      },
+      "hr_train_events": 74
+    }
+  },
+  "n_features": {
+    "full": 141,
+    "live": 7
+  },
+  "feature_mapping": [
+    {
+      "feature": "miss_distance_m",
+      "kelvins": "miss_distance [m]",
+      "live": "miss_km \u00d7 1000"
+    },
+    {
+      "feature": "relative_speed_ms",
+      "kelvins": "relative_speed [m/s]",
+      "live": "vrel_kms \u00d7 1000"
+    },
+    {
+      "feature": "time_to_tca_d",
+      "kelvins": "time_to_tca [days] of the latest CDM \u2265 2 d out",
+      "live": "(TCA \u2212 now) in days; below 2 d the model is outside its training range"
+    },
+    {
+      "feature": "log10_pc",
+      "kelvins": "risk (ESA's log10 collision probability, full covariance)",
+      "live": "log10(Pc) from our screener (isotropic assumed \u03c3), floored at \u221230"
+    },
+    {
+      "feature": "sigma_km",
+      "kelvins": "\u221a(((c_\u03c3r\u00b2+c_\u03c3t\u00b2+c_\u03c3n\u00b2)+(t_\u03c3r\u00b2+t_\u03c3t\u00b2+t_\u03c3n\u00b2))/3) / 1000",
+      "live": "combined isotropic \u03c3 (km); identical formula when \u03c3 is isotropic"
+    },
+    {
+      "feature": "miss_over_sigma",
+      "kelvins": "miss_distance / (1000\u00b7sigma_km)",
+      "live": "miss_km / sigma_km"
+    },
+    {
+      "feature": "object_type",
+      "kelvins": "c_object_type (TBA \u2192 UNKNOWN)",
+      "live": "object_type of the other object (official Space-Track type)"
+    }
+  ],
+  "results": {
+    "holdout": {
+      "baseline": {
+        "n": 1779,
+        "n_high_risk": 19,
+        "brier": 0.029792017987633503,
+        "roc_auc": 0.9763456937799043,
+        "avg_precision": 0.3369374545946122,
+        "precision": 0.22580645161290322,
+        "recall": 0.7368421052631579,
+        "f1": 0.345679012345679,
+        "f2": 0.5072463768115941,
+        "false_alert_rate": 0.02727272727272727,
+        "false_alerts_per_1000": 26.981450252951095,
+        "alerts": 62,
+        "tp": 14,
+        "fp": 48,
+        "fn": 5,
+        "tn": 1712,
+        "mse_log_risk": 88.0055994479254,
+        "mse_high_risk": 0.26458027273727697,
+        "mse_high_risk_unclipped": 0.6809778040515027,
+        "official_score": 0.5216011091106318
+      },
+      "full": {
+        "n": 1779,
+        "n_high_risk": 19,
+        "brier": 0.007884353793058733,
+        "roc_auc": 0.9711124401913875,
+        "avg_precision": 0.45645000741642755,
+        "precision": 0.16666666666666666,
+        "recall": 0.7894736842105263,
+        "f1": 0.27522935779816515,
+        "f2": 0.4518072289156626,
+        "false_alert_rate": 0.04261363636363636,
+        "false_alerts_per_1000": 42.158516020236085,
+        "alerts": 90,
+        "tp": 15,
+        "fp": 75,
+        "fn": 4,
+        "tn": 1685,
+        "mse_log_risk": 36.45405053457456,
+        "mse_high_risk": 0.2122017426154855,
+        "mse_high_risk_unclipped": 34.970419491986895,
+        "official_score": 0.4696731903222746,
+        "alt_f2_threshold": {
+          "threshold": 0.1388,
+          "precision": 0.2894736842105263,
+          "recall": 0.5789473684210527,
+          "f2": 0.48245614035087725,
+          "false_alerts_per_1000": 15.177065767284992,
+          "mse_high_risk": 0.4899454021546215,
+          "official_score": 1.0155231971932155
+        }
+      },
+      "live": {
+        "n": 1779,
+        "n_high_risk": 19,
+        "brier": 0.008681429377211471,
+        "roc_auc": 0.9556967703349283,
+        "avg_precision": 0.3465126339115046,
+        "precision": 0.18518518518518517,
+        "recall": 0.7894736842105263,
+        "f1": 0.3,
+        "f2": 0.4777070063694267,
+        "false_alert_rate": 0.0375,
+        "false_alerts_per_1000": 37.09949409780776,
+        "alerts": 81,
+        "tp": 15,
+        "fp": 66,
+        "fn": 4,
+        "tn": 1694,
+        "mse_log_risk": 37.8297345429823,
+        "mse_high_risk": 0.2233051118190736,
+        "mse_high_risk_unclipped": 22.53340338035401,
+        "official_score": 0.46745203407459407,
+        "alt_f2_threshold": {
+          "threshold": 0.0969,
+          "precision": 0.21875,
+          "recall": 0.7368421052631579,
+          "f2": 0.49999999999999994,
+          "false_alerts_per_1000": 28.10567734682406,
+          "mse_high_risk": 0.3980509200893037,
+          "official_score": 0.7961018401786075
+        }
+      }
+    },
+    "official_test": {
+      "baseline": {
+        "n": 2167,
+        "n_high_risk": 150,
+        "brier": 0.04522381172127365,
+        "roc_auc": 0.9444554619071227,
+        "avg_precision": 0.6650765911180723,
+        "precision": 0.6460674157303371,
+        "recall": 0.7666666666666667,
+        "f1": 0.701219512195122,
+        "f2": 0.7390745501285348,
+        "false_alert_rate": 0.031234506693108576,
+        "false_alerts_per_1000": 29.072450392247347,
+        "alerts": 178,
+        "tp": 115,
+        "fp": 63,
+        "fn": 35,
+        "tn": 1954,
+        "mse_log_risk": 92.88472803048225,
+        "mse_high_risk": 0.5125094743635268,
+        "mse_high_risk_unclipped": 26.64298405757408,
+        "official_score": 0.6934476018344761
+      },
+      "full": {
+        "n": 2167,
+        "n_high_risk": 150,
+        "brier": 0.046138868460719136,
+        "roc_auc": 0.9564253842340108,
+        "avg_precision": 0.6578927623963012,
+        "precision": 0.5813953488372093,
+        "recall": 0.8333333333333334,
+        "f1": 0.684931506849315,
+        "f2": 0.7668711656441718,
+        "false_alert_rate": 0.04462072384729797,
+        "false_alerts_per_1000": 41.532071988924784,
+        "alerts": 215,
+        "tp": 125,
+        "fp": 90,
+        "fn": 25,
+        "tn": 1927,
+        "mse_log_risk": 37.82132659748382,
+        "mse_high_risk": 0.4879149374208818,
+        "mse_high_risk_unclipped": 49.374652133076694,
+        "official_score": 0.6362410783968299,
+        "alt_f2_threshold": {
+          "threshold": 0.1388,
+          "precision": 0.7345132743362832,
+          "recall": 0.5533333333333333,
+          "f2": 0.5820476858345021,
+          "false_alerts_per_1000": 13.84402399630826,
+          "mse_high_risk": 0.9072126058032416,
+          "official_score": 1.5586568384041237
+        }
+      },
+      "live": {
+        "n": 2167,
+        "n_high_risk": 150,
+        "brier": 0.04998285077106964,
+        "roc_auc": 0.9543976202280614,
+        "avg_precision": 0.653339188951502,
+        "precision": 0.6009852216748769,
+        "recall": 0.8133333333333334,
+        "f1": 0.6912181303116148,
+        "f2": 0.759651307596513,
+        "false_alert_rate": 0.04015865146256817,
+        "false_alerts_per_1000": 37.3788647900323,
+        "alerts": 203,
+        "tp": 122,
+        "fp": 81,
+        "fn": 28,
+        "tn": 1936,
+        "mse_log_risk": 42.84931911967788,
+        "mse_high_risk": 0.5045959656678962,
+        "mse_high_risk_unclipped": 56.517746827843624,
+        "official_score": 0.6642468203792142,
+        "alt_f2_threshold": {
+          "threshold": 0.0969,
+          "precision": 0.6230366492146597,
+          "recall": 0.7933333333333333,
+          "f2": 0.752212389380531,
+          "false_alerts_per_1000": 33.22565759113982,
+          "mse_high_risk": 0.5083343486548951,
+          "official_score": 0.6757856635059194
+        }
+      }
+    }
+  },
+  "intervals": {
+    "holdout": {
+      "n_boot": 600,
+      "models": {
+        "baseline": {
+          "brier": {
+            "lo": 0.022484541877459248,
+            "hi": 0.03766160764474424
+          },
+          "roc_auc": {
+            "lo": 0.9626106259540335,
+            "hi": 0.9877307618220227
+          },
+          "f2": {
+            "lo": 0.3508261933904529,
+            "hi": 0.650722156045265
+          },
+          "mse_high_risk": {
+            "lo": 0.08256250556661966,
+            "hi": 0.5582965138110321
+          },
+          "official_score": {
+            "lo": 0.1588881431092044,
+            "hi": 1.284051307850294
+          }
+        },
+        "full": {
+          "brier": {
+            "lo": 0.0049394598698439636,
+            "hi": 0.011370042459274749
+          },
+          "roc_auc": {
+            "lo": 0.9474176403491037,
+            "hi": 0.989212276175682
+          },
+          "f2": {
+            "lo": 0.3104480922803904,
+            "hi": 0.5803984788359787
+          },
+          "mse_high_risk": {
+            "lo": 0.056150337993209475,
+            "hi": 0.5088894191196611
+          },
+          "official_score": {
+            "lo": 0.12261068593074494,
+            "hi": 1.2839064995417329
+          }
+        },
+        "live": {
+          "brier": {
+            "lo": 0.005568392850137353,
+            "hi": 0.012466085722795311
+          },
+          "roc_auc": {
+            "lo": 0.917236406764749,
+            "hi": 0.9858379312240781
+          },
+          "f2": {
+            "lo": 0.327802212448354,
+            "hi": 0.6081493078444298
+          },
+          "mse_high_risk": {
+            "lo": 0.06911938182354503,
+            "hi": 0.5108353937827341
+          },
+          "official_score": {
+            "lo": 0.13724772053617196,
+            "hi": 1.262328199741513
+          }
+        }
+      },
+      "vs_baseline": {
+        "full": {
+          "brier": {
+            "lo": -0.02944226195714411,
+            "hi": -0.014679862253395046
+          },
+          "roc_auc": {
+            "lo": -0.01906035081077667,
+            "hi": 0.004937612281298958
+          },
+          "f2": {
+            "lo": -0.11752764906452183,
+            "hi": 0.02385923167742428
+          },
+          "mse_high_risk": {
+            "lo": -0.12729023203754572,
+            "hi": 0.013930036850362782
+          },
+          "official_score": {
+            "lo": -0.21263552847589454,
+            "hi": 0.14744447655801632
+          }
+        },
+        "live": {
+          "brier": {
+            "lo": -0.028950814810064535,
+            "hi": -0.013844435653409166
+          },
+          "roc_auc": {
+            "lo": -0.04833567217911959,
+            "hi": 0.0005716297314753
+          },
+          "f2": {
+            "lo": -0.08863182340397632,
+            "hi": 0.044969849728389216
+          },
+          "mse_high_risk": {
+            "lo": -0.1182508485534659,
+            "hi": 0.029246222271871278
+          },
+          "official_score": {
+            "lo": -0.22579347459545018,
+            "hi": 0.13142638398363038
+          }
+        }
+      }
+    },
+    "official_test": {
+      "n_boot": 600,
+      "models": {
+        "baseline": {
+          "brier": {
+            "lo": 0.0373788647900323,
+            "hi": 0.05399169358560221
+          },
+          "roc_auc": {
+            "lo": 0.9186720917493387,
+            "hi": 0.9655445874331486
+          },
+          "f2": {
+            "lo": 0.6700930382207446,
+            "hi": 0.7884533469268047
+          },
+          "mse_high_risk": {
+            "lo": 0.35726959689651006,
+            "hi": 0.7141018215658621
+          },
+          "official_score": {
+            "lo": 0.46443868845513225,
+            "hi": 0.9822930267816089
+          }
+        },
+        "full": {
+          "brier": {
+            "lo": 0.03860062350625498,
+            "hi": 0.053882499100621144
+          },
+          "roc_auc": {
+            "lo": 0.9338297507518982,
+            "hi": 0.9708160468681898
+          },
+          "f2": {
+            "lo": 0.7072570725707257,
+            "hi": 0.8115010496433597
+          },
+          "mse_high_risk": {
+            "lo": 0.34208121967221466,
+            "hi": 0.6543228919198982
+          },
+          "official_score": {
+            "lo": 0.43594408119869327,
+            "hi": 0.8778347548840683
+          }
+        },
+        "live": {
+          "brier": {
+            "lo": 0.04204650403530848,
+            "hi": 0.058196120059823775
+          },
+          "roc_auc": {
+            "lo": 0.9323954446294699,
+            "hi": 0.9690070549919302
+          },
+          "f2": {
+            "lo": 0.7013992482742483,
+            "hi": 0.8080951887899496
+          },
+          "mse_high_risk": {
+            "lo": 0.346947381345809,
+            "hi": 0.6863363705556017
+          },
+          "official_score": {
+            "lo": 0.44061395912346063,
+            "hi": 0.9512798736218359
+          }
+        }
+      },
+      "vs_baseline": {
+        "full": {
+          "brier": {
+            "lo": -0.008087542107015771,
+            "hi": 0.00892399581646737
+          },
+          "roc_auc": {
+            "lo": -0.006665482302790037,
+            "hi": 0.027739909248854066
+          },
+          "f2": {
+            "lo": -0.0067126170697450055,
+            "hi": 0.06664688575480948
+          },
+          "mse_high_risk": {
+            "lo": -0.08586659632542185,
+            "hi": 0.02243113071577869
+          },
+          "official_score": {
+            "lo": -0.15449653719715817,
+            "hi": 0.015016337833970664
+          }
+        },
+        "live": {
+          "brier": {
+            "lo": -0.004637837776729059,
+            "hi": 0.013239332118285149
+          },
+          "roc_auc": {
+            "lo": -0.0039911404246738115,
+            "hi": 0.024639031870637432
+          },
+          "f2": {
+            "lo": -0.004092943015814715,
+            "hi": 0.05231968565377593
+          },
+          "mse_high_risk": {
+            "lo": -0.05474052212650002,
+            "hi": 0.030855839907052783
+          },
+          "official_score": {
+            "lo": -0.10615899879678425,
+            "hi": 0.030224548754935403
+          }
+        }
+      }
+    }
+  },
+  "calibration": {
+    "holdout": {
+      "full": [
+        {
+          "bin": "0.00\u20130.01",
+          "n": 1635,
+          "mean_predicted": 0.0013606596700810646,
+          "observed_rate": 0.001834862385321101,
+          "positives": 3
+        },
+        {
+          "bin": "0.01\u20130.02",
+          "n": 27,
+          "mean_predicted": 0.015511613726099141,
+          "observed_rate": 0.037037037037037035,
+          "positives": 1
+        },
+        {
+          "bin": "0.02\u20130.05",
+          "n": 31,
+          "mean_predicted": 0.029286495221864297,
+          "observed_rate": 0.0,
+          "positives": 0
+        },
+        {
+          "bin": "0.05\u20130.10",
+          "n": 33,
+          "mean_predicted": 0.07054690750291216,
+          "observed_rate": 0.06060606060606061,
+          "positives": 2
+        },
+        {
+          "bin": "0.10\u20130.20",
+          "n": 28,
+          "mean_predicted": 0.13684294128902746,
+          "observed_rate": 0.14285714285714285,
+          "positives": 4
+        },
+        {
+          "bin": "0.20\u20130.40",
+          "n": 12,
+          "mean_predicted": 0.29923190032519076,
+          "observed_rate": 0.16666666666666666,
+          "positives": 2
+        },
+        {
+          "bin": "0.40\u20130.70",
+          "n": 11,
+          "mean_predicted": 0.5077033339449825,
+          "observed_rate": 0.45454545454545453,
+          "positives": 5
+        },
+        {
+          "bin": "0.70\u20131.00",
+          "n": 2,
+          "mean_predicted": 0.711111111111111,
+          "observed_rate": 1.0,
+          "positives": 2
+        }
+      ],
+      "live": [
+        {
+          "bin": "0.00\u20130.01",
+          "n": 1539,
+          "mean_predicted": 0.0009847541848907251,
+          "observed_rate": 0.001949317738791423,
+          "positives": 3
+        },
+        {
+          "bin": "0.01\u20130.02",
+          "n": 109,
+          "mean_predicted": 0.013348250357836872,
+          "observed_rate": 0.0,
+          "positives": 0
+        },
+        {
+          "bin": "0.02\u20130.05",
+          "n": 50,
+          "mean_predicted": 0.02849383415436432,
+          "observed_rate": 0.02,
+          "positives": 1
+        },
+        {
+          "bin": "0.05\u20130.10",
+          "n": 17,
+          "mean_predicted": 0.0709280110113516,
+          "observed_rate": 0.058823529411764705,
+          "positives": 1
+        },
+        {
+          "bin": "0.10\u20130.20",
+          "n": 45,
+          "mean_predicted": 0.15405010357904192,
+          "observed_rate": 0.17777777777777778,
+          "positives": 8
+        },
+        {
+          "bin": "0.20\u20130.40",
+          "n": 19,
+          "mean_predicted": 0.261865057917065,
+          "observed_rate": 0.3157894736842105,
+          "positives": 6
+        }
+      ]
+    },
+    "official_test": {
+      "full": [
+        {
+          "bin": "0.00\u20130.01",
+          "n": 1880,
+          "mean_predicted": 0.0013059541429274169,
+          "observed_rate": 0.011170212765957447,
+          "positives": 21
+        },
+        {
+          "bin": "0.01\u20130.02",
+          "n": 33,
+          "mean_predicted": 0.015810055466416676,
+          "observed_rate": 0.030303030303030304,
+          "positives": 1
+        },
+        {
+          "bin": "0.02\u20130.05",
+          "n": 51,
+          "mean_predicted": 0.03063720591686085,
+          "observed_rate": 0.058823529411764705,
+          "positives": 3
+        },
+        {
+          "bin": "0.05\u20130.10",
+          "n": 58,
+          "mean_predicted": 0.07221698707992236,
+          "observed_rate": 0.41379310344827586,
+          "positives": 24
+        },
+        {
+          "bin": "0.10\u20130.20",
+          "n": 59,
+          "mean_predicted": 0.1401921093842051,
+          "observed_rate": 0.5932203389830508,
+          "positives": 35
+        },
+        {
+          "bin": "0.20\u20130.40",
+          "n": 44,
+          "mean_predicted": 0.2989012059893371,
+          "observed_rate": 0.7954545454545454,
+          "positives": 35
+        },
+        {
+          "bin": "0.40\u20130.70",
+          "n": 38,
+          "mean_predicted": 0.5261786711425731,
+          "observed_rate": 0.7631578947368421,
+          "positives": 29
+        },
+        {
+          "bin": "0.70\u20131.00",
+          "n": 4,
+          "mean_predicted": 0.7065656565656566,
+          "observed_rate": 0.5,
+          "positives": 2
+        }
+      ],
+      "live": [
+        {
+          "bin": "0.00\u20130.01",
+          "n": 1763,
+          "mean_predicted": 0.0009109779438723812,
+          "observed_rate": 0.006806579693703914,
+          "positives": 12
+        },
+        {
+          "bin": "0.01\u20130.02",
+          "n": 144,
+          "mean_predicted": 0.013475567707193863,
+          "observed_rate": 0.0763888888888889,
+          "positives": 11
+        },
+        {
+          "bin": "0.02\u20130.05",
+          "n": 57,
+          "mean_predicted": 0.028049038154840295,
+          "observed_rate": 0.08771929824561403,
+          "positives": 5
+        },
+        {
+          "bin": "0.05\u20130.10",
+          "n": 13,
+          "mean_predicted": 0.07910448323279787,
+          "observed_rate": 0.3076923076923077,
+          "positives": 4
+        },
+        {
+          "bin": "0.10\u20130.20",
+          "n": 124,
+          "mean_predicted": 0.15942843231817905,
+          "observed_rate": 0.5403225806451613,
+          "positives": 67
+        },
+        {
+          "bin": "0.20\u20130.40",
+          "n": 66,
+          "mean_predicted": 0.26280692161494384,
+          "observed_rate": 0.7727272727272727,
+          "positives": 51
+        }
+      ]
+    }
+  },
+  "importance": {
+    "full": [
+      {
+        "feature": "latest_risk",
+        "importance": 0.0015976242939833222,
+        "std": 0.0003382087594035809
+      },
+      {
+        "feature": "c_sigma_ndot",
+        "importance": 0.0003343828402025506,
+        "std": 0.0003550222848803285
+      },
+      {
+        "feature": "max_risk_estimate_first",
+        "importance": 0.0002675707801045473,
+        "std": 7.150655620118453e-05
+      },
+      {
+        "feature": "mission_id",
+        "importance": 0.00020417275643402964,
+        "std": 0.00019528954803125386
+      },
+      {
+        "feature": "risk_first",
+        "importance": 9.22441403271607e-05,
+        "std": 4.5241546134438145e-05
+      },
+      {
+        "feature": "t_rcs_estimate",
+        "importance": 8.488060991612635e-05,
+        "std": 1.8035523302333706e-05
+      },
+      {
+        "feature": "risk_min",
+        "importance": 7.070914968623971e-05,
+        "std": 5.5017707328276515e-05
+      },
+      {
+        "feature": "t_residuals_accepted",
+        "importance": 6.060852126227941e-05,
+        "std": 4.2609296605334435e-05
+      },
+      {
+        "feature": "t_ct_r",
+        "importance": 5.961088672345929e-05,
+        "std": 2.893040277917838e-05
+      },
+      {
+        "feature": "c_ctdot_n",
+        "importance": 5.773305085947323e-05,
+        "std": 4.878141553863843e-05
+      },
+      {
+        "feature": "t_cn_r",
+        "importance": 5.043169590814608e-05,
+        "std": 8.027707492395919e-05
+      },
+      {
+        "feature": "c_actual_od_span",
+        "importance": 5.011366889533047e-05,
+        "std": 1.723556494502993e-05
+      },
+      {
+        "feature": "t_crdot_n",
+        "importance": 4.6357362689518084e-05,
+        "std": 9.019192499335611e-05
+      },
+      {
+        "feature": "risk_slope",
+        "importance": 4.359812527013915e-05,
+        "std": 0.0002442704501248099
+      },
+      {
+        "feature": "c_sigma_r",
+        "importance": 4.210037629206716e-05,
+        "std": 7.247021207480341e-05
+      }
+    ],
+    "live": [
+      {
+        "feature": "log10_pc",
+        "importance": 0.002219014052562655,
+        "std": 0.00018409051017648145
+      },
+      {
+        "feature": "miss_over_sigma",
+        "importance": 0.00045027876776356076,
+        "std": 0.00015703625796151312
+      },
+      {
+        "feature": "sigma_km",
+        "importance": 0.00017841651342467824,
+        "std": 0.0001462827190851622
+      },
+      {
+        "feature": "relative_speed_ms",
+        "importance": -1.7666177560430717e-05,
+        "std": 5.206647012954514e-05
+      },
+      {
+        "feature": "miss_distance_m",
+        "importance": -3.864726141769646e-05,
+        "std": 0.00024672505870299976
+      },
+      {
+        "feature": "time_to_tca_d",
+        "importance": -4.915491274925816e-05,
+        "std": 0.00015245436170058835
+      },
+      {
+        "feature": "object_type",
+        "importance": -7.764781815245672e-05,
+        "std": 8.705143486656805e-05
+      }
+    ]
+  },
+  "published": {
+    "latest_risk_baseline": {
+      "score": 0.694,
+      "mse_hr": 0.513,
+      "f2": 0.739
+    },
+    "winner_sesc": {
+      "score": 0.556,
+      "mse_hr": 0.407,
+      "f2": 0.733
+    },
+    "source": "https://arxiv.org/abs/2008.03069"
+  },
+  "model_files_bytes": {
+    "full": 1516453,
+    "live": 184128
+  },
+  "train_seconds": 92.0,
+  "verdict": {
+    "holdout": {
+      "full": [
+        "Kelvins score L: 0.47 vs baseline 0.522; not distinguishable from the baseline (95% CI of the difference -0.213 to 0.147).",
+        "Brier score: 0.00788 vs baseline 0.0298; better than the baseline (95% CI of the difference -0.0294 to -0.0147).",
+        "F2: 0.452 vs baseline 0.507; not distinguishable from the baseline (95% CI of the difference -0.118 to 0.0239).",
+        "MSE on high-risk events: 0.212 vs baseline 0.265; not distinguishable from the baseline (95% CI of the difference -0.127 to 0.0139)."
+      ],
+      "live": [
+        "Kelvins score L: 0.467 vs baseline 0.522; not distinguishable from the baseline (95% CI of the difference -0.226 to 0.131).",
+        "Brier score: 0.00868 vs baseline 0.0298; better than the baseline (95% CI of the difference -0.029 to -0.0138).",
+        "F2: 0.478 vs baseline 0.507; not distinguishable from the baseline (95% CI of the difference -0.0886 to 0.045).",
+        "MSE on high-risk events: 0.223 vs baseline 0.265; not distinguishable from the baseline (95% CI of the difference -0.118 to 0.0292)."
+      ]
+    },
+    "official_test": {
+      "full": [
+        "Kelvins score L: 0.636 vs baseline 0.693; not distinguishable from the baseline (95% CI of the difference -0.154 to 0.015).",
+        "Brier score: 0.0461 vs baseline 0.0452; not distinguishable from the baseline (95% CI of the difference -0.00809 to 0.00892).",
+        "F2: 0.767 vs baseline 0.739; not distinguishable from the baseline (95% CI of the difference -0.00671 to 0.0666).",
+        "MSE on high-risk events: 0.488 vs baseline 0.513; not distinguishable from the baseline (95% CI of the difference -0.0859 to 0.0224)."
+      ],
+      "live": [
+        "Kelvins score L: 0.664 vs baseline 0.693; not distinguishable from the baseline (95% CI of the difference -0.106 to 0.0302).",
+        "Brier score: 0.05 vs baseline 0.0452; not distinguishable from the baseline (95% CI of the difference -0.00464 to 0.0132).",
+        "F2: 0.76 vs baseline 0.739; not distinguishable from the baseline (95% CI of the difference -0.00409 to 0.0523).",
+        "MSE on high-risk events: 0.505 vs baseline 0.513; not distinguishable from the baseline (95% CI of the difference -0.0547 to 0.0309)."
+      ]
+    }
+  }
+}
