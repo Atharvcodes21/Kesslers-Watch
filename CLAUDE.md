@@ -3,7 +3,7 @@
 Hackathon prototype (24h). Goal: a working, impressive demo, not production. Prefer simple + working over complete.
 
 ## What it does
-1. Loads live TLEs (CelesTrak, no auth) for debris + active sats.
+1. Loads the full on-orbit catalog (Space-Track GP, official object types; CelesTrak fallback).
 2. Propagates orbits with SGP4 and renders them on a 3D Earth.
 3. Screens a selected asset vs. catalog for conjunctions; computes miss distance, TCA, Pc.
 4. Recommends along-track delta-v to bring Pc below threshold.
@@ -15,24 +15,45 @@ Hackathon prototype (24h). Goal: a working, impressive demo, not production. Pre
 
 ## Commands
 - Backend: `cd backend && pip install -r requirements.txt && uvicorn main:app --reload --port 8000`
+- Retrain the AI risk model: `cd backend && pip install -r requirements-train.txt && python ml.py train` (writes backend/models/; ~2 min)
 - Frontend: `cd frontend && npm install && npm run dev` (http://localhost:3000)
 - Frontend reads `NEXT_PUBLIC_API_URL` (default http://localhost:8000)
 
 ## Data sources
-- TLEs: `https://celestrak.org/NORAD/elements/gp.php?GROUP={group}&FORMAT=tle`
-  Groups: stations, active, cosmos-1408-debris, fengyun-1c-debris, iridium-33-debris, cosmos-2251-debris
-- Cache TLEs to `backend/cache/` for 2h. CelesTrak blocks repeated downloads; never fetch per request.
-- Space weather: NOAA SWPC JSON (F10.7, Kp). Cache too.
-- Space-Track / CDMs: optional, needs login; not required for demo.
+- Secrets live in `backend/.env` (gitignored): SPACETRACK_USER, SPACETRACK_PASS, N2YO_API_KEY. Never hardcode, log, or send them to the frontend; upstream errors are sanitized before reaching clients.
+- Primary catalog: Space-Track GP class, all on-orbit objects:
+  `https://www.space-track.org/basicspacedata/query/class/gp/decay_date/null-val/epoch/%3Enow-10/predicates/NORAD_CAT_ID,OBJECT_NAME,OBJECT_TYPE,EPOCH,DECAY_DATE,TLE_LINE1,TLE_LINE2/orderby/norad_cat_id%20asc/format/json`
+  Login: POST `https://www.space-track.org/ajaxauth/login` (identity, password), cookie session.
+  Rate rules (documented): <30 requests/min, <300/hour, GP at most once per hour; never one request per satellite. We refresh the full catalog at most every 4 h (cache `backend/cache/spacetrack_gp.json`), limit to 25/min and 250/h, and back off 15 min after a failure.
+  Single object: `.../class/gp/norad_cat_id/{N}/predicates/.../format/json` (cached 4 h; misses 10 min).
+- Use the official OBJECT_TYPE: PAYLOAD / ROCKET BODY / DEBRIS / UNKNOWN.
+- Fallback (no credentials or Space-Track failure): CelesTrak `https://celestrak.org/NORAD/elements/gp.php?GROUP={group}&FORMAT=tle`
+  Groups: stations, active, cosmos-1408-debris, fengyun-1c-debris, iridium-33-debris, cosmos-2251-debris. Cache to `backend/cache/` for 2h; never fetch per request. Types are inferred from names (DEB / R/B) and marked "inferred".
+  Single object fallback: `https://celestrak.org/NORAD/elements/gp.php?CATNR={N}&FORMAT=tle`.
 - Ship a fallback snapshot `backend/cache/sample_tles.txt` so the demo works offline.
+- N2YO REST v1 (`https://api.n2yo.com/rest/v1/satellite/...&apiKey=KEY`): `above` and `visualpasses` are limited to 100 transactions/hour each (we cap at 90). Cache: above 60 s, passes 30 min.
+- Space weather: NOAA SWPC JSON (F10.7, Kp). Cache too.
+- Space-Track CDMs: not used.
+- AI risk model training data: ESA Kelvins Collision Avoidance Challenge CDMs (2015–2019), `backend/data/kelvins/kelvins_competition_data/` (train_data/train_data.csv; official test inputs test_data.csv + labels test_data_private.csv `true_risk`). Gitignored. https://kelvins.esa.int/collision-avoidance-challenge/ · paper arXiv:2008.03069.
+  Kelvins task: target = `risk` (log10) of the event's last CDM; inputs only CDMs with time_to_tca ≥ 2 d; high-risk = final risk ≥ −6. Official score L = MSE_HR / F2, MSE on true-high-risk events with predictions clipped below at −6 (reproduces the published latest-risk baseline 0.694 exactly).
 
 ## API contract
-- GET  /catalog → [{norad, name, group, tle1, tle2, epoch, perigee_km, apogee_km}]
-- POST /screen {norad, horizon_h=24, screen_km=10, hbr_m=20} → [{norad, name, tca_utc, miss_km, vrel_kms, sigma_km, pc, alert}]
-- POST /maneuver {norad, secondary, tca_utc} → [{lead_h, dv_ms, new_miss_km, new_pc}]
-- GET  /reentry → [{norad, name, perigee_km, est_days, risk}]
-- GET  /spaceweather → {f107, kp, ap, updated}
-- GET  /metrics → {objects_tracked, pairs_per_sec, median_tle_age_h, brier_score}
+- GET  /catalog → [{norad, name, object_type, type_source, group, tle1, tle2, epoch, perigee_km, apogee_km}]
+  object_type ∈ PAYLOAD | ROCKET BODY | DEBRIS | UNKNOWN; type_source ∈ space-track (official) | inferred. Gzipped.
+- GET  /status → {objects, by_type, catalog: {source, fetched_utc, type_source, note}, spacetrack_configured, n2yo_configured, default_observer}
+- GET  /object/{norad} → catalog entry for any NORAD ID (cache → Space-Track → CelesTrak CATNR). 404 not found, 410 re-entered, 502 upstream failure.
+- GET  /above?lat=15.3647&lon=75.1240&radius=70&alt_m=627 → {observer, radius_deg, count, satellites: [{norad, name, int_designator, launch_date, lat, lon, alt_km}], cached}. Default observer: Hubballi (Hubli), Karnataka. The frontend lets the user change it (browser geolocation, or city search via the keyless Open-Meteo geocoding API, GeoNames data, non-commercial use; called from the browser on submit only, results cached per session) and sends lat/lon/alt_m on every request. The choice is remembered in sessionStorage.
+- GET  /passes/{norad}?lat&lon&alt_m&days=10&min_visibility=60 → {observer, norad, name, count, passes: [{start_utc, start_az_compass, max_utc, max_el, max_az_compass, end_utc, end_az_compass, mag, duration_s}], cached}
+  N2YO endpoints return 503 if the key is missing, 429 at our hourly cap, 502 on upstream errors, each with a readable `detail`.
+- POST /screen {norad, horizon_h=24 (≤72), screen_km=10 (≤50), hbr_m=20} → [{norad, name, object_type, tca_utc, miss_km, vrel_kms, sigma_km, pc, alert, level, primary_norad, ai_p_high, ai_log10_risk, ai_in_domain}], sorted by Pc.
+  ai_* = live AI model estimate (label it "AI risk (model est.)"): P(final risk ≥ 1e-6) and estimated final log10 risk; ai_in_domain false when TCA is < 2 d or > 7 d away (outside training range).
+  alert = Pc ≥ 1e-4; level ∈ alert | watch (Pc ≥ 1e-6) | low. Run stats (pairs/sec etc.) go to GET /metrics → last_screen.
+  Implementation notes: a perigee/apogee prefilter (±screen_km + 100 km) skips objects whose shell cannot reach the asset; objects that stay within screen_km for the whole window (docked modules/vehicles, formation flyers) are excluded and counted as co_located_excluded, not reported as conjunctions. After the 1 s refinement, the miss distance is polished within ±1 s along the local relative motion.
+- POST /maneuver {norad, secondary, tca_utc, hbr_m=20} → [{lead_h, dv_ms (+ prograde / − retrograde), direction, new_miss_km, new_pc, baseline_miss_km, baseline_pc, sigma_km, target_pc=1e-6, feasible}] for leads 0.5/1/2/6/12/24 h before TCA. Estimates.
+- GET  /reentry?limit=25 → [{norad, name, object_type, perigee_km, apogee_km, est_days, risk, tle_age_days, overdue, basis}] (perigee < 400 km; heuristic, est.). UI shows overdue as "imminent (est.)".
+- GET  /spaceweather → {f107, f107_time_utc, kp, kp_time_utc, ap, ap_basis, source, updated, stale} (NOAA SWPC, cached 30 min; Ap = mean of last 8 three-hourly ap)
+- GET  /metrics → {objects_tracked, pairs_per_sec, median_tle_age_h, brier_score (full model, held-out events), last_screen}
+- GET  /model/metrics → backend/models/metrics.json: dataset, split, thresholds, results {holdout, official_test} × {baseline, full, live} (brier, roc_auc, precision, recall, f1, f2, false_alert_rate, mse_log_risk, mse_high_risk, official_score, …), bootstrap intervals, calibration, importance, feature_mapping, verdict. 404 if untrained.
 
 ## Physics rules (do not deviate)
 - Units: km, km/s, seconds, UTC. Convert to m/s only for display of delta-v.
@@ -53,7 +74,8 @@ Hackathon prototype (24h). Goal: a working, impressive demo, not production. Pre
 - Model panel (separate): Brier score, pairs/sec, objects tracked, TLE age.
 - Click an object → camera flies to it, shows orbit trail and stats.
 - Monospace (JetBrains Mono / Geist Mono) for numbers, coordinates, timestamps. Sans for labels.
-- Must not drop below 30 fps with 10k objects. Propagate positions in a Web Worker if needed.
+- Must stay at 30+ fps with the full catalog (~32k objects). SGP4 runs in a Web Worker (`public/workers/propagate.worker.js`, loads the vendored satellite.js UMD build copied by `scripts/vendor-satellite.mjs` before dev/build). Snapshots every 0.2–1 s; the shader extrapolates between them with two-body gravity.
+- Earth rotates by GMST (satellite.js gstime) of the simulated time; day/night from the real sun direction at that time.
 
 ## Build order (stop and demo-check after each)
 1. Backend /catalog + Earth + debris points rendering.

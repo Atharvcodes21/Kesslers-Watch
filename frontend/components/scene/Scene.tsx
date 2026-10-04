@@ -3,14 +3,31 @@
 import { Canvas } from "@react-three/fiber";
 import { Suspense } from "react";
 import type { CatalogEntry } from "@/lib/api";
+import type { Vec3 } from "@/lib/orbit";
 import { PALETTE } from "@/lib/theme";
-import { CameraRig, HOME_DISTANCE, type Insets } from "./CameraRig";
+import { CameraRig, HOME_DISTANCE, type Framing, type Insets } from "./CameraRig";
+import { ConjunctionLine } from "./ConjunctionLine";
 import { Earth } from "./Earth";
 import { MilkyWay } from "./MilkyWay";
-import { ObjectField, type LayerVisibility } from "./ObjectField";
+import { ObjectField, type FocusRoles, type LayerVisibility } from "./ObjectField";
 import { SelectedOrbit } from "./SelectedOrbit";
 import { ShellRings } from "./ShellRings";
 import { Starfield } from "./Starfield";
+import { TcaMarker } from "./TcaMarker";
+
+/** Focus mode: highlight a few objects, fade the rest, draw their orbits and markers. */
+export interface SceneFocus {
+  roles: FocusRoles;
+  orbits: { entry: CatalogEntry; color: string }[];
+  /** Sim time (ms) the orbit paths start from. */
+  at: number;
+  /** Two objects to join with a line (conjunction). */
+  line: [CatalogEntry, CatalogEntry] | null;
+  /** Point of closest approach, marked with a pulsing ring. */
+  tcaPoint: Vec3 | null;
+  /** Where the camera glides to and holds; null = follow the selection as usual. */
+  cameraPoint: Vec3 | null;
+}
 
 export interface SceneProps {
   catalog: CatalogEntry[];
@@ -19,10 +36,24 @@ export interface SceneProps {
   selectedAt: number;
   alerts: ReadonlySet<number>;
   onSelect: (norad: number) => void;
+  onFps?: (fps: number) => void;
   insets: Insets;
+  framing: Framing;
+  focus: SceneFocus | null;
 }
 
-export default function Scene({ catalog, layers, selected, selectedAt, alerts, onSelect, insets }: SceneProps) {
+export default function Scene({
+  catalog,
+  layers,
+  selected,
+  selectedAt,
+  alerts,
+  onSelect,
+  onFps,
+  insets,
+  framing,
+  focus,
+}: SceneProps) {
   return (
     <div className="fixed inset-0 cursor-grab touch-none active:cursor-grabbing">
       <Canvas
@@ -44,9 +75,23 @@ export default function Scene({ catalog, layers, selected, selectedAt, alerts, o
           selected={selected?.norad ?? null}
           alerts={alerts}
           onSelect={onSelect}
+          focus={focus?.roles ?? null}
+          onFps={onFps}
         />
-        <SelectedOrbit entry={selected} at={selectedAt} />
-        <CameraRig target={selected} targetAt={selectedAt} insets={insets} />
+        {focus ? (
+          focus.orbits.map((o) => <SelectedOrbit key={o.entry.norad} entry={o.entry} at={focus.at} color={o.color} glow />)
+        ) : (
+          <SelectedOrbit entry={selected} at={selectedAt} />
+        )}
+        {focus?.line && <ConjunctionLine a={focus.line[0]} b={focus.line[1]} />}
+        {focus?.tcaPoint && <TcaMarker point={focus.tcaPoint} />}
+        <CameraRig
+          target={selected}
+          targetAt={selectedAt}
+          insets={insets}
+          framing={framing}
+          focusPoint={focus?.cameraPoint ?? null}
+        />
       </Canvas>
     </div>
   );

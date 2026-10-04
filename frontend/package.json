@@ -6,7 +6,9 @@
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
-    "lint": "eslint"
+    "lint": "eslint",
+    "predev": "node scripts/vendor-satellite.mjs",
+    "prebuild": "node scripts/vendor-satellite.mjs"
   },
   "dependencies": {
     "@react-three/drei": "^10.7.9",

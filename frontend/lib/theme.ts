@@ -14,12 +14,21 @@ export const PALETTE = {
 
 export const TYPE_COLORS: Record<ObjectType, string> = {
   payload: PALETTE.ice,
-  debris: PALETTE.silver,
   rocket: PALETTE.amber,
+  debris: PALETTE.silver,
+  unknown: PALETTE.muted,
 };
 
 export const TYPE_LABELS: Record<ObjectType, string> = {
   payload: "Payloads",
-  debris: "Debris",
   rocket: "Rocket bodies",
+  debris: "Debris",
+  unknown: "Unknown",
+};
+
+export const TYPE_SINGULAR: Record<ObjectType, string> = {
+  payload: "Payload",
+  rocket: "Rocket body",
+  debris: "Debris",
+  unknown: "Unknown",
 };

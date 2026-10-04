@@ -5,6 +5,7 @@ import { useFrame } from "@react-three/fiber";
 import { useMemo, useRef } from "react";
 import * as THREE from "three";
 import { earthRotation, sunDirection } from "@/lib/orbit";
+import { simNow } from "@/lib/simClock";
 
 const earthVertex = /* glsl */ `
   varying vec3 vN;
@@ -102,7 +103,6 @@ const auraFragment = /* glsl */ `
   }
 `;
 
-const SUN_UPDATE_EVERY_S = 1;
 
 export function Earth() {
   const [day, night] = useTexture(
@@ -127,15 +127,14 @@ export function Earth() {
     [day, night],
   );
 
-  const lastUpdate = useRef(-Infinity);
+  // Every frame, from the simulated clock: Earth turns by GMST (so the texture's Greenwich
+  // meridian sits under the right sky) and the day/night terminator follows the real sun.
   useFrame(({ clock }) => {
     const mat = matRef.current;
     if (!mat) return;
     const t = clock.getElapsedTime();
     if (auraRef.current) auraRef.current.uniforms.uTime.value = t;
-    if (t - lastUpdate.current < SUN_UPDATE_EVERY_S) return;
-    lastUpdate.current = t;
-    const now = new Date();
+    const now = new Date(simNow());
     if (earthRef.current) earthRef.current.rotation.y = earthRotation(now);
     (mat.uniforms.uSun.value as THREE.Vector3).set(...sunDirection(now));
   });

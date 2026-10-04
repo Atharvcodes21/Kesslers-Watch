@@ -6,8 +6,21 @@ import type { CatalogEntry } from "@/lib/api";
 import { orbitPath, toSatrec } from "@/lib/orbit";
 import { PALETTE } from "@/lib/theme";
 
-/** One revolution of the selected object's orbit as a thin gold line (SGP4-propagated from now). */
-export function SelectedOrbit({ entry, at }: { entry: CatalogEntry | null; at: number }) {
+/**
+ * One revolution of an object's orbit (SGP4-propagated from `at`) as a thin line.
+ * `glow` adds a wide, faint underlay so the line reads as softly glowing (focus mode).
+ */
+export function SelectedOrbit({
+  entry,
+  at,
+  color = PALETTE.gold,
+  glow = false,
+}: {
+  entry: CatalogEntry | null;
+  at: number;
+  color?: string;
+  glow?: boolean;
+}) {
   const points = useMemo(() => {
     if (!entry) return null;
     const s = toSatrec(entry);
@@ -17,5 +30,10 @@ export function SelectedOrbit({ entry, at }: { entry: CatalogEntry | null; at: n
   }, [entry, at]);
 
   if (!points) return null;
-  return <Line points={points} color={PALETTE.gold} lineWidth={1} transparent opacity={0.75} depthWrite={false} />;
+  return (
+    <group>
+      {glow && <Line points={points} color={color} lineWidth={5} transparent opacity={0.12} depthWrite={false} />}
+      <Line points={points} color={color} lineWidth={glow ? 1.4 : 1} transparent opacity={glow ? 0.9 : 0.75} depthWrite={false} />
+    </group>
+  );
 }

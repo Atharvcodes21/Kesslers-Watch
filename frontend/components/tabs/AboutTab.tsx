@@ -26,12 +26,12 @@ const STEPS = [
   {
     n: "I",
     title: "Gather",
-    body: "Public two-line element sets for the space stations and four major breakup clouds are pulled from CelesTrak, cached for two hours.",
+    body: "The latest element sets for every tracked object still in orbit come from Space-Track, refreshed at most every four hours, with CelesTrak as a fallback.",
   },
   {
     n: "II",
     title: "Propagate",
-    body: "Each object is flown forward with the SGP4 model, the same propagator the element sets were fitted with, and drawn on the globe in real time.",
+    body: "Each object is flown forward with SGP4, the propagator the element sets were fitted with, in a background thread, and drawn on a globe turned to the simulated time.",
   },
   {
     n: "III",
@@ -75,15 +75,28 @@ export function AboutTab() {
       <Glass className="p-8">
         <h2 className="heading mb-4">Data sources</h2>
         <ul>
-          <Item title="CelesTrak GP element sets" status="in-use">
-            Groups: stations, cosmos-1408-debris, fengyun-1c-debris, iridium-33-debris, cosmos-2251-debris. Cached for
-            two hours; a bundled snapshot is used if CelesTrak cannot be reached.
+          <Item title="Space-Track GP catalog" status="in-use">
+            Primary source: the latest general perturbations element set for every on-orbit object (no decay date,
+            epoch within 10 days), with the official object type. Fetched at most every 4 hours, within Space-Track&apos;s
+            published rate limits. Single objects are looked up by NORAD ID on demand.
           </Item>
-          <Item title="NOAA SWPC space weather" status="soon">
-            Solar flux F10.7 and geomagnetic Kp / Ap, which drive upper-atmosphere density and drag.
+          <Item title="CelesTrak GP element sets" status="in-use">
+            Fallback when Space-Track credentials are missing or a request fails: groups stations, active and four
+            breakup clouds, cached for two hours, with a bundled offline snapshot. Also used for single-object lookups.
+          </Item>
+          <Item title="N2YO" status="in-use">
+            Satellites above an observer and upcoming visible passes, cached on the server within N2YO&apos;s hourly
+            limits. The API key never leaves the server.
+          </Item>
+          <Item title="ESA Kelvins conjunction data" status="in-use">
+            About 13,000 real conjunction events (2015–2019) from ESA&apos;s Collision Avoidance Challenge, used to train and
+            test the AI risk model. See the Model tab.
+          </Item>
+          <Item title="NOAA SWPC space weather" status="in-use">
+            Solar flux F10.7 and geomagnetic Kp / Ap (cached 30 min), which drive upper-atmosphere density and drag.
           </Item>
           <Item title="Space-Track conjunction messages" status="soon">
-            Optional; requires an account. Not needed for this demo.
+            Not used yet; conjunctions will be screened from element sets.
           </Item>
         </ul>
       </Glass>
@@ -107,8 +120,13 @@ export function AboutTab() {
             certified prediction.
           </Item>
           <Item title="Object type" status="assumption">
-            Read from catalog naming: names containing DEB are debris, R/B are rocket bodies, everything else is a
-            payload.
+            Official Space-Track OBJECT_TYPE when available. With the CelesTrak fallback it is inferred from names
+            (DEB = debris, R/B = rocket body, otherwise payload) and labelled &ldquo;inferred&rdquo;. Pasted TLEs are
+            typed Unknown.
+          </Item>
+          <Item title="Smooth motion between updates" status="assumption">
+            Positions are recomputed with SGP4 every 0.2–1 s; in between, each point is extrapolated with two-body
+            gravity. The next SGP4 update corrects any drift.
           </Item>
         </ul>
       </Glass>

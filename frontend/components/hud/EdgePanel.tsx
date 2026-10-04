@@ -6,6 +6,8 @@ import { Glass } from "./Glass";
 export const PANEL_WIDTH = 340;
 export const PILL_HEIGHT = 40;
 export const PILL_GAP = 10;
+/** Bottom time dock (24 px offset + ~56 px tall) plus a gap: panels must stop above it. */
+export const DOCK_CLEARANCE = 100;
 
 /**
  * Compact pill tab docked at a screen edge. Clicking it expands its panel just below; clicking
@@ -18,6 +20,9 @@ export function EdgePanel({
   open,
   onToggle,
   top,
+  panelTop: panelTopOverride,
+  bottomClearance = DOCK_CLEARANCE,
+  badge,
   className = "",
   children,
 }: {
@@ -28,11 +33,17 @@ export function EdgePanel({
   onToggle: () => void;
   /** Top of the pill in px; the panel opens beneath it. */
   top: number;
+  /** Where the panel opens; defaults to just below the pill. Lets stacked pills share one slot. */
+  panelTop?: number;
+  /** Space kept free below the panel (px), e.g. for the time dock. The panel scrolls inside. */
+  bottomClearance?: number;
+  /** Small count shown on the pill (e.g. alerts). */
+  badge?: ReactNode;
   className?: string;
   children: ReactNode;
 }) {
   const id = useId();
-  const panelTop = top + PILL_HEIGHT + PILL_GAP;
+  const panelTop = panelTopOverride ?? top + PILL_HEIGHT + PILL_GAP;
   const edge: CSSProperties = side === "left" ? { left: 24 } : { right: 24 };
 
   return (
@@ -49,6 +60,7 @@ export function EdgePanel({
       >
         <Icon className="h-4 w-4" strokeWidth={1.75} />
         {label}
+        {badge}
       </button>
 
       <Glass
@@ -58,7 +70,7 @@ export function EdgePanel({
             ? "visible translate-y-0 opacity-100"
             : "pointer-events-none! invisible -translate-y-1.5 opacity-0"
         } ${className}`}
-        style={{ ...edge, top: panelTop, width: PANEL_WIDTH, maxHeight: `calc(100dvh - ${panelTop + 24}px)` }}
+        style={{ ...edge, top: panelTop, width: PANEL_WIDTH, maxHeight: `calc(100dvh - ${panelTop + bottomClearance}px)` }}
       >
         <div id={id} role="region" aria-label={label} inert={!open} className="min-h-0 flex-1 overflow-y-auto overscroll-contain p-5">
           {children}

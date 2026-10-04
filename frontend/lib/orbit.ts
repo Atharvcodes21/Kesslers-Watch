@@ -1,7 +1,10 @@
 import { gstime, propagate, sunPos, jday, twoline2satrec, type SatRec } from "satellite.js";
+import type { CatalogEntry } from "./api";
 
 /** Earth equatorial radius in km. Scene units are Earth radii. */
 export const R_EARTH_KM = 6378.137;
+const MU_EARTH = 398600.4418; // km^3/s^2
+const DAY_MS = 86_400_000;
 
 export type Vec3 = [number, number, number];
 
@@ -91,4 +94,59 @@ export function medianTleAgeHours(epochs: string[], now: Date): number | null {
 /** Assumed isotropic 1-sigma position error (CLAUDE.md physics rules): 0.5 km + 1 km per day of TLE age. */
 export function assumedSigmaKm(tleAgeDays: number): number {
   return 0.5 + 1.0 * Math.abs(tleAgeDays);
+}
+
+/** TLE epoch as a JS Date (from the satrec's Julian date). */
+export function tleEpoch(satrec: SatRec): Date {
+  return new Date((satrec.jdsatepoch - 2440587.5) * DAY_MS);
+}
+
+export interface ParsedTle {
+  entry: CatalogEntry;
+  epoch: Date;
+  ageDays: number;
+}
+
+/**
+ * Parse a pasted 2- or 3-line TLE into a catalog entry. Throws an Error with a readable
+ * message if the lines are malformed or SGP4 cannot propagate them.
+ */
+export function parsePastedTle(text: string, now: Date): ParsedTle {
+  const lines = text
+    .split(/\r?\n/)
+    .map((l) => l.trimEnd())
+    .filter((l) => l.trim().length > 0);
+  const i1 = lines.findIndex((l) => l.startsWith("1 "));
+  if (i1 < 0 || !lines[i1 + 1]?.startsWith("2 ")) {
+    throw new Error("Expected line 1 starting with \"1 \" followed by line 2 starting with \"2 \".");
+  }
+  const l1 = lines[i1];
+  const l2 = lines[i1 + 1];
+  if (l1.length < 69 || l2.length < 69) throw new Error("TLE lines must be 69 characters long.");
+  const name = (i1 > 0 ? lines[i1 - 1].replace(/^0 /, "").trim() : "") || "Pasted object";
+
+  let satrec: SatRec;
+  try {
+    satrec = twoline2satrec(l1, l2);
+  } catch {
+    throw new Error("Could not parse these TLE lines.");
+  }
+  if (satrec.error || !positionAt(satrec, now)) throw new Error("SGP4 cannot propagate this element set to the current time.");
+
+  const n = satrec.no / 60; // rad/s
+  const a = Math.cbrt(MU_EARTH / (n * n));
+  const epoch = tleEpoch(satrec);
+  const entry: CatalogEntry = {
+    norad: Number.parseInt(satrec.satnum, 10),
+    name,
+    object_type: "UNKNOWN",
+    type_source: "pasted",
+    group: "pasted",
+    tle1: l1,
+    tle2: l2,
+    epoch: epoch.toISOString(),
+    perigee_km: Math.round((a * (1 - satrec.ecco) - R_EARTH_KM) * 10) / 10,
+    apogee_km: Math.round((a * (1 + satrec.ecco) - R_EARTH_KM) * 10) / 10,
+  };
+  return { entry, epoch, ageDays: (now.getTime() - epoch.getTime()) / DAY_MS };
 }

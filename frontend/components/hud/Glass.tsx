@@ -1,4 +1,6 @@
 import type { CSSProperties, ReactNode } from "react";
+import type { CatalogEntry, ObjectType } from "@/lib/api";
+import { TYPE_COLORS, TYPE_SINGULAR } from "@/lib/theme";
 
 export const DASH = "—";
 
@@ -65,5 +67,27 @@ export function SectionTitle({ children, aside }: { children: ReactNode; aside?:
       <h2 className="heading">{children}</h2>
       {aside}
     </div>
+  );
+}
+
+/** Object-type pill: colour dot + label. Marks types that are not official Space-Track values. */
+export function TypeBadge({
+  type,
+  source,
+}: {
+  type: ObjectType;
+  source?: CatalogEntry["type_source"];
+}) {
+  const color = TYPE_COLORS[type];
+  const note = source === "inferred" ? " (inferred)" : source === "pasted" ? " (pasted TLE)" : "";
+  return (
+    <span
+      title={source === "space-track" ? "Official Space-Track OBJECT_TYPE" : note.trim() || undefined}
+      className="inline-flex shrink-0 items-center gap-1.5 whitespace-nowrap rounded-full border border-white/12 px-2 py-px font-sans text-[14px] text-ivory"
+    >
+      <span className="h-2 w-2 rounded-full" style={{ background: color, boxShadow: `0 0 6px ${color}` }} />
+      {TYPE_SINGULAR[type]}
+      {note && <span className="text-muted">{note}</span>}
+    </span>
   );
 }
