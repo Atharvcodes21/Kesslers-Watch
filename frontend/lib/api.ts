@@ -425,6 +425,61 @@ export interface ModelMetrics {
     source: string;
   };
   verdict: Record<EvalSet, Record<"full" | "live", string[]>>;
+  /** LSTM benchmark (`python ml.py lstm`); absent until it has been run. */
+  model_comparison?: ModelComparison | null;
+}
+
+export type ComparisonModel =
+  | "baseline"
+  | "trees_full"
+  | "trees_live"
+  | "lstm_full"
+  | "lstm_live"
+  | "lstm_full_val_iso"
+  | "lstm_live_val_iso";
+
+export interface ComparisonRow {
+  n: number;
+  n_high_risk: number;
+  brier: number;
+  ece: number;
+  pr_auc: number | null;
+  roc_auc: number | null;
+  /** At the model's own threshold chosen on validation for ≥ 95% recall. */
+  recall: number;
+  false_alert_rate: number;
+  precision: number;
+  alerts: number;
+  tp: number;
+  fn: number;
+  fp: number;
+  threshold: number;
+}
+
+export type ComparisonPair = "lstm_full_vs_trees_full" | "lstm_live_vs_trees_live";
+
+export interface ModelComparison {
+  generated_utc: string;
+  /** generated_utc of the trees it was compared with (a later retrain makes this stale). */
+  trees_trained_utc: string | null;
+  versions: { torch: string };
+  method: {
+    split: string;
+    lstm: string;
+    calibration: string;
+    selection: string;
+    baseline: string;
+    inputs: Record<"lstm_full" | "lstm_live", string>;
+  };
+  lstm: Record<"full" | "live", { weighting: string; pos_weight: number; epochs: number; hidden: number; inputs_per_cdm: number; parameters: number }>;
+  results: Record<"validation" | EvalSet, Record<ComparisonModel, ComparisonRow>>;
+  /** 95% bootstrap CI of LSTM − trees. */
+  diff_ci: Record<EvalSet, Record<ComparisonPair, Record<"brier" | "pr_auc" | "false_alert_rate", Interval>>>;
+  lstm_better_on_validation: Record<"full" | "live", boolean>;
+  live_model: "trees" | "lstm";
+  live_rule: string;
+  reason: string;
+  seconds: number;
 }
 
 export interface OperatingPoint {

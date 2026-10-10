@@ -17,6 +17,7 @@ Hackathon prototype (24h). Goal: a working, impressive demo, not production. Pre
 ## Commands
 - Backend: `cd backend && pip install -r requirements.txt && uvicorn main:app --reload --port 8000`
 - Retrain the AI risk model: `cd backend && pip install -r requirements-train.txt && python ml.py train` (writes backend/models/; ~5 min)
+- LSTM benchmark vs the trees: `cd backend && pip install -r requirements-lstm.txt && python ml.py lstm` (PyTorch CPU, ~5–10 min; same split/target; saved to metrics.json model_comparison, kept across retrains; the trees stay live unless the live-input LSTM beats them on validation Brier AND PR-AUC)
 - Measure screening throughput KPI: `cd backend && python ml.py throughput` (~5 min: ISS 72 h, whole watchlist 72 h, all-vs-all slice; saved to metrics.json kpis.throughput, kept across retrains)
 - Recompute the Go / No-Go decision-level KPIs without retraining: `cd backend && python ml.py decision-kpis` (~10 s; metrics.json kpis.decision_levels; `train` computes them too)
 - Sentinel starts with the API (FastAPI lifespan). `SENTINEL_DISABLED=1` turns it off. A restart resumes the hourly schedule from the last run in sentinel.db.

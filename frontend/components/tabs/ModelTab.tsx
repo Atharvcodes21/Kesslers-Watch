@@ -6,11 +6,15 @@ import {
   ApiError,
   fetchModelMetrics,
   type CalibrationBin,
+  type ComparisonModel,
+  type ComparisonPair,
   type DecisionLevel,
   type DecisionLevels,
   type EvalSet,
   type ImportanceRow,
+  type Interval,
   type Kpis,
+  type ModelComparison,
   type ModelMetrics,
   type ModelName,
   type ScoreSet,
@@ -212,6 +216,112 @@ function Verdicts({ m, ds }: { m: ModelMetrics; ds: EvalSet }) {
         high-risk validation events (full {fmt(m.thresholds.full, 4)}, live {fmt(m.thresholds.live, 4)}). Missing a dangerous
         event costs far more than a false alarm, so this trades many more false alerts for recall, which also lowers F2 and
         raises the Kelvins score L compared with a threshold tuned for F2.
+      </p>
+    </Glass>
+  );
+}
+
+const CMP_ROWS: { key: ComparisonModel; label: string; inputs: string; group: "base" | "live" | "full" }[] = [
+  { key: "baseline", label: "Baseline", inputs: "latest risk", group: "base" },
+  { key: "trees_live", label: "Gradient-boosted trees", inputs: "live inputs, latest CDM", group: "live" },
+  { key: "lstm_live", label: "LSTM", inputs: "live inputs, CDM sequence", group: "live" },
+  { key: "trees_full", label: "Gradient-boosted trees", inputs: "all CDM columns + trends", group: "full" },
+  { key: "lstm_full", label: "LSTM", inputs: "all CDM columns, sequence", group: "full" },
+];
+const CMP_COLS: { key: "brier" | "recall" | "false_alert_rate" | "pr_auc"; label: string; digits: number; pct: boolean }[] = [
+  { key: "brier", label: "Brier", digits: 4, pct: false },
+  { key: "recall", label: "Recall", digits: 1, pct: true },
+  { key: "false_alert_rate", label: "False alerts", digits: 1, pct: true },
+  { key: "pr_auc", label: "PR-AUC", digits: 3, pct: false },
+];
+
+const signed = (v: number | null, digits: number) => (v === null ? DASH : `${v > 0 ? "+" : v < 0 ? "−" : ""}${Math.abs(v).toFixed(digits)}`);
+const ciText = (iv: Interval, digits: number) => (iv.lo === null || iv.hi === null ? DASH : `${signed(iv.lo, digits)} to ${signed(iv.hi, digits)}`);
+
+/** LSTM benchmark vs the gradient-boosted trees and the baseline (`python ml.py lstm`). */
+function ModelComparisonTable({ mc, treesUtc }: { mc: ModelComparison; treesUtc: string }) {
+  const sets: EvalSet[] = ["holdout", "official_test"];
+  const liveKey: ComparisonModel = mc.live_model === "lstm" ? "lstm_live" : "trees_live";
+  const valIso = (k: "lstm_live" | "lstm_full") =>
+    sets.map((ds) => fmt(mc.results[ds][`${k}_val_iso` as ComparisonModel]?.brier, 4)).join(" / ");
+  return (
+    <Glass className="overflow-x-auto p-7">
+      <h2 className="heading mb-1">Model comparison</h2>
+      <p className="mb-4 max-w-[76ch] text-[14px] text-muted">
+        A small LSTM reading each event&apos;s sequence of warnings, against our gradient-boosted trees and the baseline. Same events,
+        same split, same target, inputs only from CDMs ≥ 2 days before closest approach, same isotonic calibration. Recall and
+        false alerts are at each model&apos;s own threshold, chosen on validation to catch ≥ 95% of high-risk events.
+      </p>
+      <table className="w-full min-w-[760px] text-left text-[15px]">
+        <thead className="text-[14px] text-muted">
+          <tr>
+            <th className="pb-1.5 pr-4 font-medium">Model</th>
+            {sets.map((ds) => (
+              <th key={ds} className="pb-1.5 pr-4 font-medium" colSpan={CMP_COLS.length}>
+                {SET_LABEL[ds]} ({mc.results[ds].baseline.n.toLocaleString()} events, {mc.results[ds].baseline.n_high_risk} high-risk)
+              </th>
+            ))}
+          </tr>
+          <tr>
+            <th />
+            {sets.map((ds) => (
+              <Fragment key={ds}>
+                {CMP_COLS.map((c) => (
+                  <th key={c.key} className="pb-1.5 pr-4 text-right font-medium">
+                    {c.label}
+                  </th>
+                ))}
+              </Fragment>
+            ))}
+          </tr>
+        </thead>
+        <tbody>
+          {CMP_ROWS.map((row, i) => (
+            <tr
+              key={row.key}
+              className={`divider align-top ${row.key === "baseline" ? "text-ivory/70" : ""} ${
+                i > 0 && CMP_ROWS[i - 1].group !== row.group ? "border-t border-white/10" : ""
+              }`}
+            >
+              <td className="py-1.5 pr-4">
+                {row.label}
+                {row.key === liveKey && <span className="ml-2 text-[14px] font-semibold text-gold">live</span>}
+                <div className="text-[14px] text-muted">{row.inputs}</div>
+              </td>
+              {sets.map((ds) => (
+                <Fragment key={ds}>
+                  {CMP_COLS.map((c) => (
+                    <td key={c.key} className="py-1.5 pr-4 text-right font-mono">
+                      {fmt(mc.results[ds][row.key][c.key], c.digits, c.pct)}
+                    </td>
+                  ))}
+                </Fragment>
+              ))}
+            </tr>
+          ))}
+        </tbody>
+      </table>
+
+      <p className="mt-4 max-w-[76ch] text-[17px] text-ivory">{mc.reason}</p>
+      <div className="mt-3 grid gap-x-8 gap-y-1 md:grid-cols-2">
+        {sets.map((ds) => (
+          <div key={ds} className="text-[14px] leading-snug text-muted">
+            <span className="text-ivory">{SET_LABEL[ds]}</span>, LSTM − trees (95% bootstrap interval):
+            {(["lstm_live_vs_trees_live", "lstm_full_vs_trees_full"] as ComparisonPair[]).map((pair) => (
+              <div key={pair} className="font-mono">
+                <span className="font-sans">{pair.startsWith("lstm_live") ? "Live inputs" : "All CDM columns"}:</span> Brier{" "}
+                {ciText(mc.diff_ci[ds][pair].brier, 4)}, PR-AUC {ciText(mc.diff_ci[ds][pair].pr_auc, 3)}
+              </div>
+            ))}
+          </div>
+        ))}
+      </div>
+      <p className="mt-3 max-w-[76ch] text-[14px] leading-snug text-muted">
+        LSTM: {mc.method.lstm}; {mc.lstm.live.parameters.toLocaleString()} parameters (live inputs), {mc.lstm.full.parameters.toLocaleString()} (all
+        columns). Calibration {mc.method.calibration}. With isotonic fitted on the validation events instead, LSTM Brier (held-out /
+        official) is {valIso("lstm_live")} for live inputs and {valIso("lstm_full")} for all columns. The baseline gives a hard yes/no,
+        so its Brier score is its error rate. Benchmarked {mc.generated_utc.slice(0, 10)}, PyTorch {mc.versions.torch}.
+        {mc.trees_trained_utc !== treesUtc && " The trees were retrained after this benchmark; rerun `python ml.py lstm` to refresh it."}
       </p>
     </Glass>
   );
@@ -648,6 +758,7 @@ export function ModelTab({ total, medianAge, pairsPerSec }: { total: number; med
           <Headline m={m} ds={ds} />
           <MetricsTable m={m} ds={ds} />
           <Verdicts m={m} ds={ds} />
+          {m.model_comparison && <ModelComparisonTable mc={m.model_comparison} treesUtc={m.generated_utc} />}
 
           <div className="grid gap-6 md:grid-cols-2">
             <Glass className="p-7">

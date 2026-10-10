@@ -1637,5 +1637,485 @@
         "MSE on high-risk events: 0.424 vs baseline 0.513; better than the baseline (95% CI of the difference -0.18 to -0.0163)."
       ]
     }
+  },
+  "model_comparison": {
+    "generated_utc": "2026-10-10T13:58:49Z",
+    "trees_trained_utc": "2026-10-10T11:53:07Z",
+    "versions": {
+      "torch": "2.14.1+cpu"
+    },
+    "method": {
+      "split": "the same events as the trees (60/20/20 by event, seed 42); inputs only CDMs >= 2 days before TCA; target: final risk >= 1e-6",
+      "lstm": "per-CDM linear+ReLU projection -> 1-layer LSTM (64 units, packed variable-length sequences, max 17 CDMs) -> MLP head on [final hidden state, latest CDM]; Adam, BCE, up to 40 epochs",
+      "calibration": "as the trees: 5-fold cross-fitting on the training events, isotonic on each left-out fold, 5 calibrated models averaged",
+      "selection": "LSTM class weighting and epochs by validation PR-AUC; every alert threshold on validation (>= 95% recall)",
+      "baseline": "latest risk; Brier from its hard yes/no (risk >= 1e-6); recall/false alerts at its own 95%-recall threshold on validation; PR-AUC ranks by latest risk",
+      "inputs": {
+        "lstm_full": "every numeric CDM column + object type + mission (one-hot), per CDM",
+        "lstm_live": "per CDM, the live model's inputs: miss_distance_m, relative_speed_ms, time_to_tca_d, log10_pc, sigma_km, miss_over_sigma, object_type, radial_sep_m"
+      }
+    },
+    "lstm": {
+      "full": {
+        "weighting": "none",
+        "pos_weight": 1.0,
+        "epochs": 8,
+        "hidden": 64,
+        "batch": 128,
+        "lr": 0.001,
+        "weight_decay": 0.0001,
+        "inputs_per_cdm": 126,
+        "parameters": 47553,
+        "tried": {
+          "none": {
+            "pos_weight": 1.0,
+            "best_epochs": 8,
+            "validation_pr_auc": 0.2246539113508505
+          },
+          "balanced": {
+            "pos_weight": 95.98181818181818,
+            "best_epochs": 5,
+            "validation_pr_auc": 0.182870351399906
+          }
+        }
+      },
+      "live": {
+        "weighting": "none",
+        "pos_weight": 1.0,
+        "epochs": 18,
+        "hidden": 64,
+        "batch": 128,
+        "lr": 0.001,
+        "weight_decay": 0.0001,
+        "inputs_per_cdm": 11,
+        "parameters": 36513,
+        "tried": {
+          "none": {
+            "pos_weight": 1.0,
+            "best_epochs": 18,
+            "validation_pr_auc": 0.23561408769873435
+          },
+          "balanced": {
+            "pos_weight": 95.98181818181818,
+            "best_epochs": 16,
+            "validation_pr_auc": 0.23154865879794512
+          }
+        }
+      }
+    },
+    "results": {
+      "validation": {
+        "baseline": {
+          "n": 1779,
+          "n_high_risk": 19,
+          "brier": 0.032602585722315905,
+          "ece": 0.03260258572231591,
+          "pr_auc": 0.25798384901049964,
+          "roc_auc": 0.9701555023923445,
+          "recall": 1.0,
+          "false_alert_rate": 0.2005681818181818,
+          "precision": 0.051075268817204304,
+          "alerts": 372,
+          "tp": 19,
+          "fn": 0,
+          "fp": 353,
+          "threshold": 9.580999999999982e-12
+        },
+        "trees_full": {
+          "n": 1779,
+          "n_high_risk": 19,
+          "brier": 0.008178108801576343,
+          "ece": 0.0030882969113854566,
+          "pr_auc": 0.3668359703402798,
+          "roc_auc": 0.9655801435406698,
+          "recall": 1.0,
+          "false_alert_rate": 0.27954545454545454,
+          "precision": 0.03718199608610567,
+          "alerts": 511,
+          "tp": 19,
+          "fn": 0,
+          "fp": 492,
+          "threshold": 0.002094757622285589
+        },
+        "trees_live": {
+          "n": 1779,
+          "n_high_risk": 19,
+          "brier": 0.009116561617330009,
+          "ece": 0.0016782698604675456,
+          "pr_auc": 0.21857691015485867,
+          "roc_auc": 0.9575657894736842,
+          "recall": 1.0,
+          "false_alert_rate": 0.21704545454545454,
+          "precision": 0.04738154613466334,
+          "alerts": 401,
+          "tp": 19,
+          "fn": 0,
+          "fp": 382,
+          "threshold": 0.0033769563080060907
+        },
+        "lstm_full": {
+          "n": 1779,
+          "n_high_risk": 19,
+          "brier": 0.009556831147289686,
+          "ece": 0.006286651550321104,
+          "pr_auc": 0.2191428397569139,
+          "roc_auc": 0.9577900717703349,
+          "recall": 1.0,
+          "false_alert_rate": 0.1590909090909091,
+          "precision": 0.06354515050167224,
+          "alerts": 299,
+          "tp": 19,
+          "fn": 0,
+          "fp": 280,
+          "threshold": 0.011161435363717675
+        },
+        "lstm_live": {
+          "n": 1779,
+          "n_high_risk": 19,
+          "brier": 0.009419772288391961,
+          "ece": 0.004929906158935578,
+          "pr_auc": 0.20087954197024538,
+          "roc_auc": 0.9524671052631579,
+          "recall": 1.0,
+          "false_alert_rate": 0.22670454545454546,
+          "precision": 0.045454545454545456,
+          "alerts": 418,
+          "tp": 19,
+          "fn": 0,
+          "fp": 399,
+          "threshold": 0.008495322786076773
+        },
+        "lstm_full_val_iso": {
+          "n": 1779,
+          "n_high_risk": 19,
+          "brier": 0.008891315323666889,
+          "ece": 3.861441801499807e-19,
+          "pr_auc": 0.2143580889356853,
+          "roc_auc": 0.9631279904306221,
+          "recall": 1.0,
+          "false_alert_rate": 0.15738636363636363,
+          "precision": 0.06418918918918919,
+          "alerts": 296,
+          "tp": 19,
+          "fn": 0,
+          "fp": 277,
+          "threshold": 0.01818181818181818
+        },
+        "lstm_live_val_iso": {
+          "n": 1779,
+          "n_high_risk": 19,
+          "brier": 0.008835879863798406,
+          "ece": 8.346955005262208e-19,
+          "pr_auc": 0.22583237430269482,
+          "roc_auc": 0.9656997607655502,
+          "recall": 1.0,
+          "false_alert_rate": 0.1409090909090909,
+          "precision": 0.07116104868913857,
+          "alerts": 267,
+          "tp": 19,
+          "fn": 0,
+          "fp": 248,
+          "threshold": 0.013513513513513514
+        }
+      },
+      "holdout": {
+        "baseline": {
+          "n": 1779,
+          "n_high_risk": 19,
+          "brier": 0.029792017987633503,
+          "ece": 0.0297920179876335,
+          "pr_auc": 0.3369374545946122,
+          "roc_auc": 0.9763456937799043,
+          "recall": 1.0,
+          "false_alert_rate": 0.19375,
+          "precision": 0.05277777777777778,
+          "alerts": 360,
+          "tp": 19,
+          "fn": 0,
+          "fp": 341,
+          "threshold": 9.580999999999982e-12
+        },
+        "trees_full": {
+          "n": 1779,
+          "n_high_risk": 19,
+          "brier": 0.007784276589559272,
+          "ece": 0.0058489742764998,
+          "pr_auc": 0.4516184755867821,
+          "roc_auc": 0.9768092105263158,
+          "recall": 1.0,
+          "false_alert_rate": 0.27897727272727274,
+          "precision": 0.03725490196078431,
+          "alerts": 510,
+          "tp": 19,
+          "fn": 0,
+          "fp": 491,
+          "threshold": 0.002094757622285589
+        },
+        "trees_live": {
+          "n": 1779,
+          "n_high_risk": 19,
+          "brier": 0.008416200575265513,
+          "ece": 0.0038559899307019844,
+          "pr_auc": 0.36682239039181136,
+          "roc_auc": 0.9652362440191387,
+          "recall": 1.0,
+          "false_alert_rate": 0.225,
+          "precision": 0.04578313253012048,
+          "alerts": 415,
+          "tp": 19,
+          "fn": 0,
+          "fp": 396,
+          "threshold": 0.0033769563080060907
+        },
+        "lstm_full": {
+          "n": 1779,
+          "n_high_risk": 19,
+          "brier": 0.009089798452547749,
+          "ece": 0.0054003227499807484,
+          "pr_auc": 0.2713284392771472,
+          "roc_auc": 0.9319228468899521,
+          "recall": 0.7894736842105263,
+          "false_alert_rate": 0.15852272727272726,
+          "precision": 0.05102040816326531,
+          "alerts": 294,
+          "tp": 15,
+          "fn": 4,
+          "fp": 279,
+          "threshold": 0.011161435363717675
+        },
+        "lstm_live": {
+          "n": 1779,
+          "n_high_risk": 19,
+          "brier": 0.009764279277874465,
+          "ece": 0.00598220585455547,
+          "pr_auc": 0.16474381270501456,
+          "roc_auc": 0.950912081339713,
+          "recall": 1.0,
+          "false_alert_rate": 0.22215909090909092,
+          "precision": 0.046341463414634146,
+          "alerts": 410,
+          "tp": 19,
+          "fn": 0,
+          "fp": 391,
+          "threshold": 0.008495322786076773
+        },
+        "lstm_full_val_iso": {
+          "n": 1779,
+          "n_high_risk": 19,
+          "brier": 0.00955305404321941,
+          "ece": 0.006583813846062555,
+          "pr_auc": 0.18715466286305477,
+          "roc_auc": 0.8614832535885167,
+          "recall": 0.7894736842105263,
+          "false_alert_rate": 0.15511363636363637,
+          "precision": 0.052083333333333336,
+          "alerts": 288,
+          "tp": 15,
+          "fn": 4,
+          "fp": 273,
+          "threshold": 0.01818181818181818
+        },
+        "lstm_live_val_iso": {
+          "n": 1779,
+          "n_high_risk": 19,
+          "brier": 0.011085882382333741,
+          "ece": 0.004349844100929728,
+          "pr_auc": 0.1384842571825269,
+          "roc_auc": 0.9548893540669856,
+          "recall": 1.0,
+          "false_alert_rate": 0.15,
+          "precision": 0.06713780918727916,
+          "alerts": 283,
+          "tp": 19,
+          "fn": 0,
+          "fp": 264,
+          "threshold": 0.013513513513513514
+        }
+      },
+      "official_test": {
+        "baseline": {
+          "n": 2167,
+          "n_high_risk": 150,
+          "brier": 0.04522381172127365,
+          "ece": 0.04522381172127365,
+          "pr_auc": 0.6650765911180723,
+          "roc_auc": 0.9444554619071227,
+          "recall": 0.9333333333333333,
+          "false_alert_rate": 0.19286068418443233,
+          "precision": 0.2646502835538752,
+          "alerts": 529,
+          "tp": 140,
+          "fn": 10,
+          "fp": 389,
+          "threshold": 9.580999999999982e-12
+        },
+        "trees_full": {
+          "n": 2167,
+          "n_high_risk": 150,
+          "brier": 0.04673841694707207,
+          "ece": 0.04491601137612538,
+          "pr_auc": 0.6333049135471875,
+          "roc_auc": 0.9537514460419767,
+          "recall": 0.96,
+          "false_alert_rate": 0.25780862667327714,
+          "precision": 0.21686746987951808,
+          "alerts": 664,
+          "tp": 144,
+          "fn": 6,
+          "fp": 520,
+          "threshold": 0.002094757622285589
+        },
+        "trees_live": {
+          "n": 2167,
+          "n_high_risk": 150,
+          "brier": 0.049798887154665274,
+          "ece": 0.04940333503792124,
+          "pr_auc": 0.6547008236405719,
+          "roc_auc": 0.9548041646008925,
+          "recall": 0.96,
+          "false_alert_rate": 0.2131879028259792,
+          "precision": 0.2508710801393728,
+          "alerts": 574,
+          "tp": 144,
+          "fn": 6,
+          "fp": 430,
+          "threshold": 0.0033769563080060907
+        },
+        "lstm_full": {
+          "n": 2167,
+          "n_high_risk": 150,
+          "brier": 0.057108102953666535,
+          "ece": 0.05376241023799466,
+          "pr_auc": 0.5207597051643533,
+          "roc_auc": 0.9206775739547182,
+          "recall": 0.8733333333333333,
+          "false_alert_rate": 0.15319781854238967,
+          "precision": 0.29772727272727273,
+          "alerts": 440,
+          "tp": 131,
+          "fn": 19,
+          "fp": 309,
+          "threshold": 0.011161435363717675
+        },
+        "lstm_live": {
+          "n": 2167,
+          "n_high_risk": 150,
+          "brier": 0.05676226323424916,
+          "ece": 0.05348976163875541,
+          "pr_auc": 0.587165715794246,
+          "roc_auc": 0.9361708808461411,
+          "recall": 0.9533333333333334,
+          "false_alert_rate": 0.22161626177491323,
+          "precision": 0.2423728813559322,
+          "alerts": 590,
+          "tp": 143,
+          "fn": 7,
+          "fp": 447,
+          "threshold": 0.008495322786076773
+        },
+        "lstm_full_val_iso": {
+          "n": 2167,
+          "n_high_risk": 150,
+          "brier": 0.05741601002719348,
+          "ece": 0.05479585764403308,
+          "pr_auc": 0.4761723330382863,
+          "roc_auc": 0.8905304908279624,
+          "recall": 0.8666666666666667,
+          "false_alert_rate": 0.15121467526028756,
+          "precision": 0.2988505747126437,
+          "alerts": 435,
+          "tp": 130,
+          "fn": 20,
+          "fp": 305,
+          "threshold": 0.01818181818181818
+        },
+        "lstm_live_val_iso": {
+          "n": 2167,
+          "n_high_risk": 150,
+          "brier": 0.05418886381523014,
+          "ece": 0.05218511125065047,
+          "pr_auc": 0.5386484675684793,
+          "roc_auc": 0.904513303586184,
+          "recall": 0.88,
+          "false_alert_rate": 0.1412989588497769,
+          "precision": 0.31654676258992803,
+          "alerts": 417,
+          "tp": 132,
+          "fn": 18,
+          "fp": 285,
+          "threshold": 0.013513513513513514
+        }
+      }
+    },
+    "diff_ci": {
+      "holdout": {
+        "lstm_full_vs_trees_full": {
+          "brier": {
+            "lo": -8.560728759364353e-05,
+            "hi": 0.003039266681707179
+          },
+          "pr_auc": {
+            "lo": -0.373635952000624,
+            "hi": 0.024023038552107447
+          },
+          "false_alert_rate": {
+            "lo": -0.1401731970471323,
+            "hi": -0.10176091949196338
+          }
+        },
+        "lstm_live_vs_trees_live": {
+          "brier": {
+            "lo": 0.0003520903567642472,
+            "hi": 0.002593356607614933
+          },
+          "pr_auc": {
+            "lo": -0.35505498440782585,
+            "hi": -0.030305677823903882
+          },
+          "false_alert_rate": {
+            "lo": -0.01934181510745399,
+            "hi": 0.013068367551294662
+          }
+        }
+      },
+      "official_test": {
+        "lstm_full_vs_trees_full": {
+          "brier": {
+            "lo": 0.0070135855995237485,
+            "hi": 0.013698799962061102
+          },
+          "pr_auc": {
+            "lo": -0.20267464071336655,
+            "hi": -0.034874122595123465
+          },
+          "false_alert_rate": {
+            "lo": -0.12231462276380606,
+            "hi": -0.08671476134650485
+          }
+        },
+        "lstm_live_vs_trees_live": {
+          "brier": {
+            "lo": 0.004904039345999067,
+            "hi": 0.009026391034309291
+          },
+          "pr_auc": {
+            "lo": -0.15248469620248725,
+            "hi": 0.020169909365691505
+          },
+          "false_alert_rate": {
+            "lo": -0.005481022260411921,
+            "hi": 0.023796515647708166
+          }
+        }
+      }
+    },
+    "lstm_better_on_validation": {
+      "full": false,
+      "live": false
+    },
+    "live_model": "trees",
+    "live_rule": "the LSTM replaces the live trees only if its live-input version beats them on validation Brier AND PR-AUC",
+    "reason": "Validation (live inputs): trees Brier 0.00912, PR-AUC 0.219; LSTM Brier 0.00942, PR-AUC 0.201. The LSTM is not better on both, so the trees stay live.",
+    "seconds": 570.8
   }
 }

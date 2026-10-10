@@ -3,6 +3,8 @@
 Run `python ml.py train` to (re)build backend/models/ from backend/data/kelvins/ (needs pandas, which
 only training uses; the API server imports just numpy, scikit-learn and joblib).
 Run `python ml.py throughput` to measure screening throughput on the live catalog (saved to metrics.json).
+Run `python ml.py lstm` to benchmark an LSTM over the CDM sequences against the trees (needs torch; saved to
+metrics.json model_comparison; the trees stay live unless the LSTM beats them on validation).
 Run `python ml.py decision-kpis` to recompute the Go / No-Go decision-level KPIs on the ESA test sets without
 retraining (saved to metrics.json kpis.decision_levels; `train` computes them too).
 
@@ -657,6 +659,8 @@ def train(data_dir: Path = DATA_DIR) -> dict:
             # Throughput is measured by `python ml.py throughput` on the live catalog; kept across retrains.
             "throughput": previous.get("kpis", {}).get("throughput"),
         },
+        # LSTM benchmark from `python ml.py lstm`; kept across retrains (trees_trained_utc says which trees it compared).
+        "model_comparison": previous.get("model_comparison"),
         "published": PUBLISHED,
         "model_files_bytes": sizes,
         "train_seconds": round(time.time() - t0, 1),
@@ -814,6 +818,306 @@ def verdict(m: dict) -> dict:
     return out
 
 
+# =========================================================================== LSTM benchmark (`python ml.py lstm`)
+#
+# Benchmark only: a small LSTM over each event's CDM sequence vs the gradient-boosted trees, on the SAME events,
+# split, inputs (CDMs >= 2 d before TCA) and target. Calibration mirrors the trees exactly: 5-fold cross-fitting on
+# the training events, isotonic regression on each left-out fold, the 5 calibrated models averaged
+# (= CalibratedClassifierCV(method="isotonic", cv=5)). Validation chooses the LSTM's settings and every threshold.
+# The live model stays the trees unless the live-input LSTM beats them on validation (see benchmark_lstm).
+
+LSTM_MAX_EPOCHS = 40
+LSTM_HIDDEN = 64
+LSTM_BATCH = 128
+# Live-model input -> per-CDM column (the same mapping as live_matrix, applied to every CDM in the sequence).
+LSTM_LIVE_COLUMNS = {"miss_distance_m": "miss_distance", "relative_speed_ms": "relative_speed", "time_to_tca_d": "time_to_tca",
+                     "log10_pc": "risk", "sigma_km": "sigma_km", "miss_over_sigma": "miss_over_sigma", "radial_sep_m": "radial_sep_m"}
+
+
+def _cdm_frame(df):
+    """CDMs >= 2 d before TCA, oldest first per event, plus the derived per-CDM columns the event table uses."""
+    d = df[df["time_to_tca"] >= MIN_TCA_DAYS].sort_values(["event_id", "time_to_tca"], ascending=[True, False]).reset_index(drop=True).copy()  # copy: de-fragment before adding columns
+    sigma = _isotropic_sigma_km(d)
+    d["sigma_km"] = sigma
+    d["miss_over_sigma"] = d["miss_distance"] / (1000.0 * np.where(sigma > 0, sigma, np.nan))
+    d["radial_sep_m"] = d["relative_position_r"].abs()
+    d["object_type"] = d["c_object_type"].map(OBJECT_CODES).fillna(3).astype(int)
+    return d
+
+
+class _SeqPrep:
+    """Per-CDM input scaling fitted on training CDMs: signed log for heavy-tailed columns (|p99| > 100), then
+    z-score, clipped to ±8; missing -> 0 (the training mean). Categoricals one-hot (unknown mission -> all zero)."""
+
+    def __init__(self, d, cols: list[str], missions: list[int] | None):
+        self.cols, self.missions = cols, missions
+        self.log, self.mu, self.sd = {}, {}, {}
+        for c in cols:
+            x = d[c].to_numpy(float)
+            x = x[np.isfinite(x)]
+            self.log[c] = bool(len(x)) and float(np.percentile(np.abs(x), 99)) > 100.0
+            if self.log[c]:
+                x = np.sign(x) * np.log1p(np.abs(x))
+            self.mu[c] = float(x.mean()) if len(x) else 0.0
+            sd = float(x.std()) if len(x) else 1.0
+            self.sd[c] = sd if sd > 1e-9 else 1.0
+
+    def transform(self, d) -> np.ndarray:
+        blocks = []
+        for c in self.cols:
+            x = d[c].to_numpy(float)
+            if self.log[c]:
+                x = np.sign(x) * np.log1p(np.abs(x))
+            blocks.append(np.clip((x - self.mu[c]) / self.sd[c], -8.0, 8.0))
+        ot = d["object_type"].to_numpy(int)
+        blocks += [(ot == k).astype(float) for k in range(4)]
+        if self.missions is not None:
+            mid = d["mission_id"].to_numpy()
+            blocks += [(mid == m).astype(float) for m in self.missions]
+        return np.nan_to_num(np.column_stack(blocks), nan=0.0).astype(np.float32)
+
+
+def _padded(d, M: np.ndarray, ids) -> tuple[np.ndarray, np.ndarray]:
+    """(events, max_len, features) zero-padded at the end, and each event's sequence length, in `ids` order."""
+    ev = d["event_id"].to_numpy()
+    starts = np.flatnonzero(np.r_[True, ev[1:] != ev[:-1]])
+    ends = np.r_[starts[1:], len(ev)]
+    span = {e: (s, t) for e, s, t in zip(ev[starts], starts, ends)}
+    lengths = np.array([span[e][1] - span[e][0] for e in ids], dtype=np.int64)
+    X = np.zeros((len(ids), int(lengths.max()), M.shape[1]), np.float32)
+    for i, e in enumerate(ids):
+        s, t = span[e]
+        X[i, : t - s] = M[s:t]
+    return X, lengths
+
+
+def _lstm_net(n_in: int):
+    import torch
+    from torch import nn
+    from torch.nn.utils.rnn import pack_padded_sequence
+
+    class Net(nn.Module):
+        """Per-CDM projection -> LSTM (packed, so padding is never read) -> head on [final hidden state, latest CDM]."""
+
+        def __init__(self):
+            super().__init__()
+            self.proj = nn.Sequential(nn.Linear(n_in, LSTM_HIDDEN), nn.ReLU())
+            self.lstm = nn.LSTM(LSTM_HIDDEN, LSTM_HIDDEN, batch_first=True)
+            self.head = nn.Sequential(nn.Linear(LSTM_HIDDEN + n_in, 32), nn.ReLU(), nn.Dropout(0.2), nn.Linear(32, 1))
+
+        def forward(self, x, lengths):
+            packed = pack_padded_sequence(self.proj(x), lengths, batch_first=True, enforce_sorted=False)
+            _, (h, _) = self.lstm(packed)
+            last = x[torch.arange(len(x)), lengths - 1]
+            return self.head(torch.cat([h[-1], last], dim=1)).squeeze(1)
+
+    return Net()
+
+
+def _lstm_scores(net, X: np.ndarray, L: np.ndarray) -> np.ndarray:
+    import torch
+
+    net.eval()
+    with torch.no_grad():
+        return torch.sigmoid(net(torch.from_numpy(X), torch.from_numpy(L))).numpy().astype(float)
+
+
+def _fit_lstm(X, L, y, epochs: int, pos_weight: float, seed: int, monitor=None):
+    """Adam + BCE (pos_weight up-weights high-risk events). `monitor` = (X, L, y): validation PR-AUC after each epoch."""
+    import torch
+    from sklearn.metrics import average_precision_score
+
+    torch.manual_seed(seed)
+    rng = np.random.default_rng(seed)
+    net = _lstm_net(X.shape[2])
+    opt = torch.optim.Adam(net.parameters(), lr=1e-3, weight_decay=1e-4)
+    loss_fn = torch.nn.BCEWithLogitsLoss(pos_weight=torch.tensor(float(pos_weight)))
+    Xt, Lt, yt = torch.from_numpy(X), torch.from_numpy(L), torch.from_numpy(y.astype(np.float32))
+    history = []
+    for _ in range(epochs):
+        net.train()
+        perm = rng.permutation(len(X))
+        for b in range(0, len(X), LSTM_BATCH):
+            idx = torch.from_numpy(perm[b : b + LSTM_BATCH])
+            opt.zero_grad()
+            loss_fn(net(Xt[idx], Lt[idx]), yt[idx]).backward()
+            torch.nn.utils.clip_grad_norm_(net.parameters(), 1.0)
+            opt.step()
+        if monitor is not None:
+            history.append(float(average_precision_score(monitor[2], _lstm_scores(net, monitor[0], monitor[1]))))
+    return net, history
+
+
+def _crossfit_lstm(X, L, y, epochs: int, pos_weight: float) -> list:
+    """5 (net, isotonic) pairs: each net trained on 4/5 of the training events, isotonic fitted on the left-out 1/5."""
+    from sklearn.isotonic import IsotonicRegression
+    from sklearn.model_selection import StratifiedKFold
+
+    out = []
+    for k, (tr_i, va_i) in enumerate(StratifiedKFold(5, shuffle=True, random_state=SEED).split(X, y)):
+        net, _ = _fit_lstm(X[tr_i], L[tr_i], y[tr_i], epochs, pos_weight, SEED + k)
+        iso = IsotonicRegression(y_min=0.0, y_max=1.0, out_of_bounds="clip").fit(_lstm_scores(net, X[va_i], L[va_i]), y[va_i])
+        out.append((net, iso))
+    return out
+
+
+def _paired_diff_ci(y_high: np.ndarray, a: dict, b: dict, n_boot: int = 1000, seed: int = SEED) -> dict:
+    """95% bootstrap CI (resampling events) of a − b for Brier, PR-AUC and false-alert rate."""
+    from sklearn.metrics import average_precision_score
+
+    rng = np.random.default_rng(seed)
+    n = len(y_high)
+    d: dict[str, list[float]] = {"brier": [], "pr_auc": [], "false_alert_rate": []}
+    for _ in range(n_boot):
+        i = rng.integers(0, n, n)
+        y = y_high[i]
+        if y.sum() < 3 or y.all():
+            continue
+        neg = ~y
+        d["brier"].append(float(np.mean((a["p"][i] - y) ** 2) - np.mean((b["p"][i] - y) ** 2)))
+        d["pr_auc"].append(float(average_precision_score(y, a["rank"][i]) - average_precision_score(y, b["rank"][i])))
+        d["false_alert_rate"].append(float(a["high"][i][neg].mean() - b["high"][i][neg].mean()))
+    return {k: _ci(v) for k, v in d.items()}
+
+
+def benchmark_lstm() -> dict:
+    """Train the LSTM benchmark (full-CDM and live-input variants), compare with the saved trees and the baseline on
+    validation, held-out and official test events, and save the comparison in metrics.json `model_comparison`."""
+    import joblib
+    import torch
+    from sklearn.isotonic import IsotonicRegression
+
+    t0 = time.time()
+    torch.set_num_threads(max(1, min(8, torch.get_num_threads())))
+    P = prepare()
+    trees = {"full": joblib.load(MODEL_DIR / "full.joblib"), "live": joblib.load(MODEL_DIR / "live.joblib")}
+    tr_ids, va_ids, ho_ids = list(P["tr_ids"]), list(P["va_ids"]), list(P["ho_ids"])
+    d_tr = _cdm_frame(P["tr"])
+    d_te = _cdm_frame(P["te"])
+    te_ids = list(P["feats_te"].index)
+    ys = {"train": P["y_final_all"].loc[tr_ids].to_numpy(float), "validation": P["y_final_all"].loc[va_ids].to_numpy(float),
+          "holdout": P["y_final_all"].loc[ho_ids].to_numpy(float), "official_test": P["y_te"]}
+    yb = {k: (v >= HIGH_RISK).astype(int) for k, v in ys.items()}
+
+    # Inputs per variant. Full: every numeric CDM column (the trees' "full" inputs, per CDM instead of summarised).
+    skip = {"event_id", "mission_id", "c_object_type", "object_type"}
+    full_cols = [c for c in d_tr.columns if c not in skip and np.issubdtype(d_tr[c].dtype, np.number)]
+    live_cols = [LSTM_LIVE_COLUMNS[n] for n in trees["live"]["names"] if n in LSTM_LIVE_COLUMNS]
+    missions = sorted(int(m) for m in d_tr.loc[d_tr["event_id"].isin(tr_ids), "mission_id"].unique())
+    fit_rows = d_tr[d_tr["event_id"].isin(tr_ids)]
+    variants = {"full": _SeqPrep(fit_rows, full_cols, missions), "live": _SeqPrep(fit_rows, live_cols, None)}
+
+    seqs: dict[str, dict] = {}
+    for v, prep in variants.items():
+        M_tr, M_te = prep.transform(d_tr), prep.transform(d_te)
+        seqs[v] = {"train": _padded(d_tr, M_tr, tr_ids), "validation": _padded(d_tr, M_tr, va_ids),
+                   "holdout": _padded(d_tr, M_tr, ho_ids), "official_test": _padded(d_te, M_te, te_ids)}
+    print(f"sequences: full {seqs['full']['train'][0].shape[2]} inputs/CDM, live {seqs['live']['train'][0].shape[2]}; "
+          f"max length {seqs['full']['train'][0].shape[1]} | {time.time()-t0:.0f}s", flush=True)
+
+    # ---- settings on validation: class weighting x epochs, by validation PR-AUC (rank-based, so calibration-free)
+    n_pos = int(yb["train"].sum())
+    weights = {"none": 1.0, "balanced": (len(yb["train"]) - n_pos) / max(n_pos, 1)}
+    lstm: dict[str, dict] = {}
+    for v in variants:
+        Xtr, Ltr = seqs[v]["train"]
+        mon = (*seqs[v]["validation"], yb["validation"])
+        tried = {}
+        for wk, pw in weights.items():
+            _, hist = _fit_lstm(Xtr, Ltr, yb["train"], LSTM_MAX_EPOCHS, pw, SEED, monitor=mon)
+            best = int(np.argmax(hist[4:])) + 5  # at least 5 epochs
+            tried[wk] = {"pos_weight": pw, "best_epochs": best, "validation_pr_auc": hist[best - 1], "curve": hist}
+            print(f"  lstm {v} weighting {wk}: best val PR-AUC {hist[best-1]:.3f} at epoch {best} | {time.time()-t0:.0f}s", flush=True)
+        wk = max(tried, key=lambda k: tried[k]["validation_pr_auc"])
+        fams = _crossfit_lstm(Xtr, Ltr, yb["train"], tried[wk]["best_epochs"], tried[wk]["pos_weight"])
+        raw = {ds: np.mean([_lstm_scores(n, *seqs[v][ds]) for n, _ in fams], axis=0) for ds in ("validation", "holdout", "official_test")}
+        cal = {ds: np.mean([iso.predict(_lstm_scores(n, *seqs[v][ds])) for n, iso in fams], axis=0) for ds in raw}
+        # Variant for reference: isotonic fitted on the validation events instead (raw scores averaged over the 5 nets).
+        iso_va = IsotonicRegression(y_min=0.0, y_max=1.0, out_of_bounds="clip").fit(raw["validation"], yb["validation"])
+        lstm[v] = {"p": cal, "p_val_iso": {ds: iso_va.predict(r) for ds, r in raw.items()},
+                   "hyper": {"weighting": wk, "pos_weight": tried[wk]["pos_weight"], "epochs": tried[wk]["best_epochs"], "hidden": LSTM_HIDDEN,
+                             "batch": LSTM_BATCH, "lr": 1e-3, "weight_decay": 1e-4, "inputs_per_cdm": int(seqs[v]["train"][0].shape[2]),
+                             "parameters": int(sum(p.numel() for p in fams[0][0].parameters())),
+                             "tried": {k: {kk: vv for kk, vv in t.items() if kk != "curve"} for k, t in tried.items()}}}
+        print(f"  lstm {v}: cross-fitted ({wk}, {tried[wk]['best_epochs']} epochs) | {time.time()-t0:.0f}s", flush=True)
+
+    # ---- every model's probabilities + its 95%-recall threshold from validation
+    latest = {"validation": P["latest_all"].loc[va_ids].to_numpy(float), "holdout": P["latest_all"].loc[ho_ids].to_numpy(float),
+              "official_test": P["latest_te"].to_numpy(float)}
+    feats = {"validation": P["feats_all"].loc[va_ids], "holdout": P["feats_all"].loc[ho_ids], "official_test": P["feats_te"]}
+    probs: dict[str, dict[str, np.ndarray]] = {"baseline": {}, "trees_full": {}, "trees_live": {}, "lstm_full": {}, "lstm_live": {},
+                                               "lstm_full_val_iso": {}, "lstm_live_val_iso": {}}
+    for ds in latest:
+        probs["baseline"][ds] = 10.0 ** latest[ds]  # ranking only; its Brier uses the hard yes/no (risk >= 1e-6)
+        probs["trees_full"][ds] = trees["full"]["clf"].predict_proba(feats[ds][trees["full"]["names"]].to_numpy(float))[:, 1]
+        probs["trees_live"][ds] = trees["live"]["clf"].predict_proba(live_matrix(feats[ds], trees["live"]["names"]).to_numpy(float))[:, 1]
+        for v in variants:
+            probs[f"lstm_{v}"][ds] = lstm[v]["p"][ds]
+            probs[f"lstm_{v}_val_iso"][ds] = lstm[v]["p_val_iso"][ds]
+    thresholds = {"trees_full": float(trees["full"]["threshold"]), "trees_live": float(trees["live"]["threshold"])}
+    for k in probs:
+        if k not in thresholds:
+            thresholds[k] = operating_threshold(yb["validation"], probs[k]["validation"])[0]
+
+    def pred(k: str, ds: str) -> dict:
+        p = probs[k][ds]
+        brier_p = (latest[ds] >= HIGH_RISK).astype(float) if k == "baseline" else p
+        return {"p": brier_p, "rank": p, "high": p >= thresholds[k]}
+
+    def row(k: str, ds: str) -> dict:
+        q = pred(k, ds)
+        s = score_set(ys[ds], latest[ds], q["p"], q["high"], q["rank"])
+        return {**{m: s[m] for m in ("n", "n_high_risk", "brier", "ece", "pr_auc", "roc_auc", "recall", "false_alert_rate", "precision", "alerts", "tp", "fn", "fp")},
+                "threshold": thresholds[k]}
+
+    sets = ("validation", "holdout", "official_test")
+    table = {ds: {k: row(k, ds) for k in probs} for ds in sets}
+    ci = {ds: {f"lstm_{v}_vs_trees_{v}": _paired_diff_ci(yb[ds].astype(bool), pred(f"lstm_{v}", ds), pred(f"trees_{v}", ds)) for v in variants}
+          for ds in ("holdout", "official_test")}
+
+    # ---- which model is live: the LSTM replaces the trees only if it is better on validation Brier AND PR-AUC
+    va = table["validation"]
+    lstm_wins = {v: va[f"lstm_{v}"]["brier"] < va[f"trees_{v}"]["brier"] and va[f"lstm_{v}"]["pr_auc"] > va[f"trees_{v}"]["pr_auc"] for v in variants}
+    live_choice = "lstm" if lstm_wins["live"] else "trees"
+    reason = (f"Validation (live inputs): trees Brier {va['trees_live']['brier']:.5f}, PR-AUC {va['trees_live']['pr_auc']:.3f}; "
+              f"LSTM Brier {va['lstm_live']['brier']:.5f}, PR-AUC {va['lstm_live']['pr_auc']:.3f}. "
+              + ("The LSTM is better on both." if lstm_wins["live"] else "The LSTM is not better on both, so the trees stay live."))
+    print(reason, flush=True)
+
+    m = json.loads(METRICS_PATH.read_text(encoding="utf-8")) if METRICS_PATH.exists() else {}
+    result = {
+        "generated_utc": datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
+        "trees_trained_utc": m.get("generated_utc"),
+        "versions": {"torch": torch.__version__},
+        "method": {
+            "split": "the same events as the trees (60/20/20 by event, seed 42); inputs only CDMs >= 2 days before TCA; target: final risk >= 1e-6",
+            "lstm": (f"per-CDM linear+ReLU projection -> 1-layer LSTM ({LSTM_HIDDEN} units, packed variable-length sequences, max 17 CDMs) -> "
+                     "MLP head on [final hidden state, latest CDM]; Adam, BCE, up to 40 epochs"),
+            "calibration": "as the trees: 5-fold cross-fitting on the training events, isotonic on each left-out fold, 5 calibrated models averaged",
+            "selection": "LSTM class weighting and epochs by validation PR-AUC; every alert threshold on validation (>= 95% recall)",
+            "baseline": "latest risk; Brier from its hard yes/no (risk >= 1e-6); recall/false alerts at its own 95%-recall threshold on validation; PR-AUC ranks by latest risk",
+            "inputs": {"lstm_full": "every numeric CDM column + object type + mission (one-hot), per CDM",
+                       "lstm_live": f"per CDM, the live model's inputs: {', '.join(trees['live']['names'])}"},
+        },
+        "lstm": {v: lstm[v]["hyper"] for v in variants},
+        "results": table,
+        "diff_ci": ci,
+        "lstm_better_on_validation": lstm_wins,
+        "live_model": live_choice,
+        "live_rule": "the LSTM replaces the live trees only if its live-input version beats them on validation Brier AND PR-AUC",
+        "reason": reason,
+        "seconds": round(time.time() - t0, 1),
+    }
+    m["model_comparison"] = result
+    METRICS_PATH.write_text(json.dumps(_clean(m), indent=2), encoding="utf-8")
+    for ds in sets:
+        print(f"\n{ds}:", flush=True)
+        for k, r in table[ds].items():
+            print(f"  {k:20s} Brier {r['brier']:.5f}  PR-AUC {r['pr_auc']:.3f}  recall {r['recall']:.3f}  false alerts {r['false_alert_rate']:.3f}  (thr {r['threshold']:.3g})", flush=True)
+    print(f"saved metrics.json model_comparison ({time.time()-t0:.0f}s)", flush=True)
+    return result
+
+
 # =========================================================================== runtime inference (no pandas)
 
 _models: dict | None = None
@@ -924,5 +1228,7 @@ if __name__ == "__main__":
         measure_throughput()
     elif cmd == "decision-kpis":
         measure_decision_kpis()
+    elif cmd == "lstm":
+        benchmark_lstm()
     else:
-        print("usage: python ml.py train | throughput | decision-kpis")
+        print("usage: python ml.py train | throughput | decision-kpis | lstm")
