@@ -99,7 +99,8 @@ def _refine(primary: Satrec, secondary: Satrec, t0: datetime, center_s: float, l
     """1 s grid over [center-60, center+60] ∩ [lo, hi], then sub-second polish along relative motion.
 
     `perturb(seconds_from_t0) -> (dr, dv)` (km, km/s) is added to the primary's SGP4 state when given
-    (used for post-burn trajectories). Returns (tca_s, miss_km, rel, vrel, v_primary) or None if SGP4 failed.
+    (used for post-burn trajectories). Returns (tca_s, miss_km, rel, vrel, v_primary, r_primary) or None if
+    SGP4 failed; rel = secondary − primary at TCA, r_primary the primary's position at TCA (TEME km).
     """
     tt = np.arange(max(lo_s, center_s - REFINE_HALF_S), min(hi_s, center_s + REFINE_HALF_S) + 1, 1.0)
     jd, fr = _jd(t0, tt)
@@ -118,7 +119,61 @@ def _refine(primary: Satrec, secondary: Satrec, t0: datetime, center_s: float, l
     # Closest approach of the locally linear relative motion, kept within ±1 s of the grid point.
     tau = float(np.clip(-np.dot(rel, vrel) / max(np.dot(vrel, vrel), 1e-12), -1.0, 1.0))
     rel_c = rel + vrel * tau
-    return float(tt[j] + tau), float(np.linalg.norm(rel_c)), rel_c, vrel, v1[j]
+    return float(tt[j] + tau), float(np.linalg.norm(rel_c)), rel_c, vrel, v1[j], r1[j] + v1[j] * tau
+
+
+def rtn_separation(rel: np.ndarray, r_primary: np.ndarray, v_primary: np.ndarray) -> tuple[float, float, float]:
+    """Miss vector (secondary − primary) in the primary's RTN frame: (radial, in-track, cross-track) km."""
+    rh = r_primary / np.linalg.norm(r_primary)
+    nh = np.cross(r_primary, v_primary)
+    nh /= np.linalg.norm(nh)
+    th = np.cross(nh, rh)
+    return float(rel @ rh), float(rel @ th), float(rel @ nh)
+
+
+def conjunction_record(primary_entry: dict, primary: Satrec, sec_entry: dict, secondary: Satrec, t0: datetime, ref, hbr_km: float) -> dict:
+    """One /screen result from a refinement `ref` (see _refine), times relative to t0.
+
+    σ is ASSUMED from TLE age at TCA (TLEs carry no covariance). TLE ages are also reported at t0 (screen time).
+    """
+    tca_s, miss, rel, vrel, v1, r1 = ref
+    jw, jf = _jd(t0, np.array([tca_s]))
+    tca_jd = float(jw[0] + jf[0])
+    p_epoch, s_epoch = primary.jdsatepoch + primary.jdsatepochF, secondary.jdsatepoch + secondary.jdsatepochF
+    sig = math.hypot(sigma_km(tca_jd - p_epoch), sigma_km(tca_jd - s_epoch))
+    pc = collision_probability(miss, sig, hbr_km)
+    radial, in_track, cross = rtn_separation(rel, r1, v1)
+    jw0, jf0 = _jd(t0, np.array([0.0]))
+    now_jd = float(jw0[0] + jf0[0])
+    return {
+        "norad": sec_entry["norad"],
+        "name": sec_entry["name"],
+        "object_type": sec_entry["object_type"],
+        "tca_utc": _iso(t0 + timedelta(seconds=tca_s)),
+        "miss_km": round(miss, 3),
+        # Separation at TCA in the protected asset's frame (radial out, in-track along velocity, cross-track normal).
+        "radial_km": round(radial, 3),
+        "in_track_km": round(in_track, 3),
+        "cross_track_km": round(cross, 3),
+        "vrel_kms": round(float(np.linalg.norm(vrel)), 3),
+        "sigma_km": round(sig, 3),
+        "primary_tle_age_h": round((now_jd - p_epoch) * 24.0, 1),
+        "secondary_tle_age_h": round((now_jd - s_epoch) * 24.0, 1),
+        "pc": pc,
+        "alert": pc >= PC_ALERT,
+        "level": _risk_level(pc),
+        "primary_norad": primary_entry["norad"],
+        "primary_object_type": primary_entry["object_type"],
+    }
+
+
+def describe_pair(primary_entry: dict, secondary_entry: dict, tca_utc: datetime, hbr_m: float = 20.0, window_s: float = 120.0) -> dict | None:
+    """The /screen record for one known pair near a given TCA (re-refined at 1 s), or None if SGP4 fails."""
+    primary = Satrec.twoline2rv(primary_entry["tle1"], primary_entry["tle2"])
+    secondary = Satrec.twoline2rv(secondary_entry["tle1"], secondary_entry["tle2"])
+    t0 = tca_utc.replace(microsecond=0)
+    ref = _refine(primary, secondary, t0, 0.0, -window_s, window_s)
+    return None if ref is None else conjunction_record(primary_entry, primary, secondary_entry, secondary, t0, ref, hbr_m / 1000.0)
 
 
 # --------------------------------------------------------------------------- screening
@@ -139,7 +194,6 @@ def screen(
     hbr_km = hbr_m / 1000.0
     pnorad = primary_entry["norad"]
     primary = Satrec.twoline2rv(primary_entry["tle1"], primary_entry["tle2"])
-    p_epoch_jd = primary.jdsatepoch + primary.jdsatepochF
 
     times = np.arange(0.0, horizon_s + 1e-9, COARSE_STEP_S)
     jd, fr = _jd(t0, times)
@@ -184,33 +238,13 @@ def screen(
         ref = _refine(primary, index.satrecs[i], t0, center, 0.0, horizon_s)
         if ref is None:
             continue
-        tca_s, miss, rel, vrel, _ = ref
+        tca_s, miss = ref[0], ref[1]
         if miss > screen_km:
             continue
         key = (i, int(round(tca_s / 300)))  # one event per object per 5-minute window
         if key in events and events[key]["miss_km"] <= miss:
             continue
-        tca = t0 + timedelta(seconds=tca_s)
-        jw, jf = _jd(t0, np.array([tca_s]))
-        tca_jd = float(jw[0] + jf[0])
-        s1 = sigma_km(tca_jd - p_epoch_jd)
-        s2 = sigma_km(tca_jd - index.epoch_jd[i])
-        sig = math.hypot(s1, s2)
-        pc = collision_probability(miss, sig, hbr_km)
-        sec = index.entries[i]
-        events[key] = {
-            "norad": sec["norad"],
-            "name": sec["name"],
-            "object_type": sec["object_type"],
-            "tca_utc": _iso(tca),
-            "miss_km": round(miss, 3),
-            "vrel_kms": round(float(np.linalg.norm(vrel)), 3),
-            "sigma_km": round(sig, 3),
-            "pc": pc,
-            "alert": pc >= PC_ALERT,
-            "level": _risk_level(pc),
-            "primary_norad": pnorad,
-        }
+        events[key] = conjunction_record(primary_entry, primary, index.entries[i], index.satrecs[i], t0, ref, hbr_km)
 
     results = sorted(events.values(), key=lambda c: (-c["pc"], c["miss_km"]))
     elapsed = time.perf_counter() - t_start
@@ -330,7 +364,7 @@ def screen_paths(
             ref = _refine(primary, index.satrecs[i], t0, center, 0.0, horizon_s, perturb=f)
             if ref is None:
                 continue
-            tca_s, miss, _, vrel, _ = ref
+            tca_s, miss, _, vrel, _, _ = ref
             if miss > screen_km:
                 continue
             key = (i, int(round(tca_s / 300)))
@@ -364,6 +398,53 @@ def screen_paths(
     return out, co_located, stats
 
 
+# --------------------------------------------------------------------------- throughput benchmark
+
+
+def benchmark(index: CatalogIndex, reference_norad: int = 25544, sample: int = 12, horizon_h: float = 24.0, seed: int = 42) -> dict:
+    """MEASURED time to screen one object against the full catalog, and an all-vs-all ESTIMATE from it.
+
+    Screens the reference object (ISS by default) plus `sample` objects drawn at random from the catalog
+    (so altitude shells are represented as in the catalog), each over `horizon_h` at 10 km, serially on one core.
+    All-vs-all estimate = catalog size × mean per-object time: our one-vs-catalog screen repeated for every
+    object, no pair sharing, no parallelism (an upper bound for this code; each pair is computed twice).
+    """
+    rng = np.random.default_rng(seed)
+    picks = [index.pos[reference_norad]] if reference_norad in index.pos else []
+    others = [i for i in rng.permutation(len(index.entries)) if i not in picks]
+    runs = []
+    for i in picks + others:
+        if len(runs) >= sample + len(picks):
+            break
+        e = index.entries[i]
+        try:
+            _, st = screen(index, e, horizon_h=horizon_h, screen_km=10.0)
+        except ValueError:
+            continue  # cannot be propagated over the window (decayed elements); skip
+        runs.append({"norad": e["norad"], "name": e["name"], "perigee_km": e["perigee_km"], "apogee_km": e["apogee_km"],
+                     "seconds": st["seconds"], "pairs_after_altitude_filter": st["pairs_after_altitude_filter"], "pairs_per_sec": st["pairs_per_sec"]})
+    secs = np.array([r["seconds"] for r in runs])
+    n = len(index.entries)
+    mean_s = float(secs.mean())
+    ref = next((r for r in runs if r["norad"] == reference_norad), None)
+    return {
+        "measured_utc": _iso(datetime.now(timezone.utc)),
+        "catalog_objects": n,
+        "horizon_h": horizon_h,
+        "screen_km": 10.0,
+        "reference": ref,
+        "sample_runs": runs,
+        "per_object_seconds": {"mean": round(mean_s, 2), "median": round(float(np.median(secs)), 2), "min": round(float(secs.min()), 2), "max": round(float(secs.max()), 2), "n": len(runs)},
+        "pairs_per_sec_mean": round(float(np.mean([r["pairs_per_sec"] for r in runs]))),
+        "all_vs_all_estimate": {
+            "seconds": round(n * mean_s),
+            "hours": round(n * mean_s / 3600.0, 1),
+            "unique_pairs": n * (n - 1) // 2,
+            "basis": "est.: catalog size × mean measured per-object screen time (serial, one core, no pair sharing)",
+        },
+    }
+
+
 # --------------------------------------------------------------------------- maneuver
 
 
@@ -380,7 +461,7 @@ def maneuver(primary_entry: dict, secondary_entry: dict, tca_utc: datetime, hbr_
     ref = _refine(primary, secondary, tca_utc, 0.0, -REFINE_HALF_S, REFINE_HALF_S)
     if ref is None:
         raise ValueError("SGP4 failed near the given TCA.")
-    tca_off, miss0, rel, vrel, vp = ref
+    tca_off, miss0, rel, vrel, vp, _ = ref
     tca = tca_utc + timedelta(seconds=tca_off)
     tca_jd = sum(x[0] for x in _jd(tca, np.array([0.0])))
     sig = math.hypot(

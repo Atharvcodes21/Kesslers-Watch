@@ -1,13 +1,14 @@
 "use client";
 
 import { ExternalLink } from "lucide-react";
-import { useEffect, useState } from "react";
+import { useEffect, useState, type ReactNode } from "react";
 import {
   ApiError,
   fetchModelMetrics,
   type CalibrationBin,
   type EvalSet,
   type ImportanceRow,
+  type Kpis,
   type ModelMetrics,
   type ModelName,
   type ScoreSet,
@@ -27,6 +28,8 @@ const ROWS: MetricRow[] = [
   { key: "f2", label: "F2", better: "higher", digits: 3 },
   { key: "brier", label: "Brier score", better: "lower", digits: 4 },
   { key: "roc_auc", label: "ROC-AUC", better: "higher", digits: 3 },
+  { key: "pr_auc", label: "PR-AUC (average precision)", better: "higher", digits: 3 },
+  { key: "ece", label: "Calibration error (ECE)", better: "lower", digits: 4 },
   { key: "precision", label: "Precision", better: "higher", digits: 3 },
   { key: "recall", label: "Recall", better: "higher", digits: 3 },
   { key: "f1", label: "F1", better: "higher", digits: 3 },
@@ -45,6 +48,7 @@ const FEATURE_LABEL: Record<string, string> = {
   time_to_tca_d: "Time to closest approach",
   object_type: "Object type",
   mission_id: "ESA mission (anonymised)",
+  radial_sep_m: "Radial separation",
   max_risk_estimate_first: "Max-risk estimate, first CDM",
   risk_first: "Risk at first CDM",
   risk_min: "Lowest risk so far",
@@ -202,10 +206,10 @@ function Verdicts({ m, ds }: { m: ModelMetrics; ds: EvalSet }) {
         ))}
       </div>
       <p className="mt-5 text-[14px] leading-snug text-muted">
-        Alert thresholds were set on out-of-fold training predictions: the highest probability that still catches as many
-        high-risk events as the baseline does (full {fmt(m.thresholds.full, 3)}, live {fmt(m.thresholds.live, 3)}). We first
-        tried the F2-optimal threshold and switched after seeing that it missed many high-risk test events, because the
-        test set has about 7× more of them than training. Both results are shown, so this choice is visible.
+        Alert thresholds were chosen on the validation split: the highest probability that still catches at least 95% of
+        high-risk validation events (full {fmt(m.thresholds.full, 4)}, live {fmt(m.thresholds.live, 4)}). Missing a dangerous
+        event costs far more than a false alarm, so this trades many more false alerts for recall, which also lowers F2 and
+        raises the Kelvins score L compared with a threshold tuned for F2.
       </p>
     </Glass>
   );
@@ -299,6 +303,223 @@ function ImportanceBars({ rows, title }: { rows: ImportanceRow[]; title: string 
   );
 }
 
+const pct = (v: number | null | undefined, d = 1) => (v === null || v === undefined || !Number.isFinite(v) ? DASH : `${(v * 100).toFixed(d)}%`);
+
+function KpiTile({ title, children, foot }: { title: string; children: ReactNode; foot?: ReactNode }) {
+  return (
+    <Glass className="p-6">
+      <div className="eyebrow">{title}</div>
+      <div className="mt-3 flex flex-wrap items-baseline gap-x-6 gap-y-2">{children}</div>
+      {foot && <p className="mt-3 text-[14px] leading-snug text-muted">{foot}</p>}
+    </Glass>
+  );
+}
+
+function KpiNum({ value, label, dim = false }: { value: string; label: string; dim?: boolean }) {
+  return (
+    <div>
+      <div className={`font-mono text-[30px] leading-none ${dim ? "text-ivory/70" : "text-ivory"}`}>{value}</div>
+      <div className="mt-1 text-[14px] text-muted">{label}</div>
+    </div>
+  );
+}
+
+/** Hackfest PS 1C KPIs: Brier, recall on high-risk events, PR-AUC, lead time, throughput. All read from metrics.json. */
+function KpiSection({ m, ds }: { m: ModelMetrics; ds: EvalSet }) {
+  const k = m.kpis as Kpis;
+  const r = m.results[ds];
+  const op = k.operating_point.validation;
+  const tp = k.throughput;
+  return (
+    <section className="space-y-6">
+      <div>
+        <h2 className="heading">Key results</h2>
+        <p className="mt-1 text-[14px] text-muted">
+          {SET_LABEL[ds]}, never used for training or for any choice. Alert thresholds were chosen on a separate validation split (
+          {m.split.validation_events?.toLocaleString()} events, {m.split.validation_high_risk} high-risk) to catch at least{" "}
+          {Math.round(k.operating_point.target_recall * 100)}% of high-risk events.
+        </p>
+      </div>
+      <div className="grid gap-6 md:grid-cols-2">
+        <KpiTile title="Brier score (lower is better)" foot="Baseline: final risk = latest risk, a hard yes/no, so its Brier score is its error rate.">
+          <KpiNum value={fmt(r.live.brier, 4)} label="Live model" />
+          <KpiNum value={fmt(r.full.brier, 4)} label="Full model" />
+          <KpiNum value={fmt(r.baseline.brier, 4)} label="Baseline" dim />
+        </KpiTile>
+        <KpiTile
+          title="Recall on high-risk events"
+          foot={
+            <>
+              At the operating threshold (live {pct(op.live.threshold, 2)}, full {pct(op.full.threshold, 2)}); validation recall live{" "}
+              {pct(op.live.recall)}, full {pct(op.full.recall)}
+              {!op.live.reached || !op.full.reached ? " (95% not reached)" : ""}. False-alert rate here: live {pct(r.live.false_alert_rate)}, full{" "}
+              {pct(r.full.false_alert_rate)}, baseline {pct(r.baseline.false_alert_rate)}.
+            </>
+          }
+        >
+          <KpiNum value={pct(r.live.recall)} label={`Live (${r.live.tp} of ${r.live.n_high_risk})`} />
+          <KpiNum value={pct(r.full.recall)} label={`Full (${r.full.tp} of ${r.full.n_high_risk})`} />
+          <KpiNum value={pct(r.baseline.recall)} label="Baseline" dim />
+        </KpiTile>
+        <KpiTile title="PR-AUC (higher is better)" foot={`High-risk share of these events: ${pct(r.baseline.prevalence, 2)}, the PR-AUC of a random guess.`}>
+          <KpiNum value={fmt(r.live.pr_auc, 3)} label="Live model" />
+          <KpiNum value={fmt(r.full.pr_auc, 3)} label="Full model" />
+          <KpiNum value={fmt(r.baseline.pr_auc, 3)} label="Baseline" dim />
+        </KpiTile>
+        <KpiTile
+          title="Screening throughput (measured)"
+          foot={
+            tp ? (
+              <>
+                One object against {tp.catalog_objects.toLocaleString()} objects over {tp.horizon_h} h on one core; mean over {tp.per_object_seconds.n}{" "}
+                objects {tp.per_object_seconds.mean.toFixed(1)} s. All-vs-all is an estimate: catalog size × mean time, serial. Measured{" "}
+                {tp.measured_utc.slice(0, 10)}.
+              </>
+            ) : (
+              "Not measured yet: run `python ml.py throughput` in backend/."
+            )
+          }
+        >
+          {tp?.reference && <KpiNum value={`${tp.reference.seconds.toFixed(1)} s`} label={`${tp.reference.name}, 24 h`} />}
+          {tp && <KpiNum value={`${tp.all_vs_all_estimate.hours.toLocaleString()} h`} label="All-vs-all (est.)" dim />}
+        </KpiTile>
+      </div>
+      <LeadTimeTable k={k} ds={ds} />
+      <div className="grid gap-6 md:grid-cols-2">
+        <ImbalancePanel k={k} />
+        <RadialPanel k={k} />
+      </div>
+    </section>
+  );
+}
+
+function LeadTimeTable({ k, ds }: { k: Kpis; ds: EvalSet }) {
+  const rows = k.lead_time.rows[ds] ?? [];
+  return (
+    <Glass className="overflow-x-auto p-7">
+      <h2 className="heading mb-1">Lead time</h2>
+      <p className="mb-4 text-[14px] text-muted">
+        Each method may only use warnings issued at least this many days before closest approach. Same thresholds throughout;
+        events without such an early warning drop out.
+      </p>
+      <table className="w-full min-w-[620px] text-left">
+        <thead>
+          <tr className="text-[14px] text-muted">
+            <th className="pb-2 pr-4 font-medium">Inputs from</th>
+            <th className="pb-2 pr-4 text-right font-medium">Events (high-risk)</th>
+            <th className="pb-2 pr-4 text-right font-medium">Recall: live / full / baseline</th>
+            <th className="pb-2 text-right font-medium">Brier: live / full / baseline</th>
+          </tr>
+        </thead>
+        <tbody className="font-mono text-[15px]">
+          {rows.map((row) => (
+            <tr key={row.days} className="divider">
+              <td className="py-1.5 pr-4 font-sans">{row.label} before TCA</td>
+              <td className="py-1.5 pr-4 text-right">
+                {row.n.toLocaleString()} ({row.n_high_risk})
+              </td>
+              <td className="py-1.5 pr-4 text-right">
+                {pct(row.live.recall, 0)} / {pct(row.full.recall, 0)} / <span className="text-ivory/70">{pct(row.baseline.recall, 0)}</span>
+              </td>
+              <td className="py-1.5 text-right">
+                {fmt(row.live.brier, 4)} / {fmt(row.full.brier, 4)} / <span className="text-ivory/70">{fmt(row.baseline.brier, 4)}</span>
+              </td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+      {rows.some((x) => x.n_high_risk < 10) && (
+        <p className="mt-3 text-[14px] text-muted">Rows with fewer than 10 high-risk events are too small to read much into.</p>
+      )}
+    </Glass>
+  );
+}
+
+const FS_LABEL: Record<string, string> = { full: "Full model", live_base: "Live, without radial", live_radial: "Live, with radial" };
+
+function ImbalancePanel({ k }: { k: Kpis }) {
+  const ci = k.class_imbalance;
+  return (
+    <Glass className="overflow-x-auto p-7">
+      <h2 className="heading mb-1">Class imbalance</h2>
+      <p className="mb-4 text-[14px] text-muted">
+        About 1 in 100 events ends high-risk. Before: {ci.before}. Tried: {ci.tried}. Kept the variant with the {ci.selection}.
+      </p>
+      <table className="w-full min-w-[420px] text-left">
+        <thead>
+          <tr className="text-[14px] text-muted">
+            <th className="pb-2 pr-3 font-medium">Validation Brier / ECE</th>
+            <th className="pb-2 pr-3 text-right font-medium">Unweighted</th>
+            <th className="pb-2 pr-3 text-right font-medium">Balanced + recalibrated</th>
+            <th className="pb-2 text-right font-medium">Balanced, raw</th>
+          </tr>
+        </thead>
+        <tbody className="font-mono text-[15px]">
+          {Object.entries(ci.by_feature_set).map(([fs, v]) => (
+            <tr key={fs} className="divider align-top">
+              <td className="py-1.5 pr-3 font-sans text-[15px]">{FS_LABEL[fs] ?? fs}</td>
+              {(["none", "balanced"] as const).map((key) => (
+                <td key={key} className={`py-1.5 pr-3 text-right ${v.chosen === key ? "text-gold" : ""}`}>
+                  {fmt(v[key].validation_brier, 4)}
+                  <div className="text-[14px] text-muted">{fmt(v[key].validation_ece, 4)}</div>
+                </td>
+              ))}
+              <td className="py-1.5 text-right text-ivory/70">
+                {fmt(v.balanced_uncalibrated.validation_brier, 4)}
+                <div className="text-[14px] text-muted">{fmt(v.balanced_uncalibrated.validation_ece, 4)}</div>
+              </td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+      <p className="mt-3 text-[14px] text-muted">Gold: kept. Raw weighted probabilities are inflated, which is why they are recalibrated.</p>
+    </Glass>
+  );
+}
+
+const RADIAL_ROWS = [
+  ["validation", "brier", "Validation Brier", 4],
+  ["holdout", "brier", "Held-out Brier", 4],
+  ["holdout", "pr_auc", "Held-out PR-AUC", 3],
+  ["holdout", "recall", "Held-out recall", 3],
+  ["official_test", "brier", "Official-test Brier", 4],
+  ["official_test", "pr_auc", "Official-test PR-AUC", 3],
+  ["official_test", "recall", "Official-test recall", 3],
+] as const;
+
+function RadialPanel({ k }: { k: Kpis }) {
+  const rf = k.radial_feature;
+  return (
+    <Glass className="overflow-x-auto p-7">
+      <h2 className="heading mb-1">Radial separation as an AI input</h2>
+      <p className="mb-4 text-[14px] text-muted">
+        Live model retrained with and without the radial separation at closest approach; {rf.rule}. Result: {rf.used ? "kept" : "not kept"}.
+      </p>
+      <table className="w-full min-w-[380px] text-left">
+        <thead>
+          <tr className="text-[14px] text-muted">
+            <th className="pb-2 pr-3 font-medium">Metric</th>
+            <th className="pb-2 pr-3 text-right font-medium">Without</th>
+            <th className="pb-2 text-right font-medium">With radial</th>
+          </tr>
+        </thead>
+        <tbody className="font-mono text-[15px]">
+          {RADIAL_ROWS.map(([set, key, label, digits]) => (
+            <tr key={label} className="divider">
+              <td className="py-1.5 pr-3 font-sans text-[15px]">{label}</td>
+              {(["live_base", "live_radial"] as const).map((fs) => (
+                <td key={fs} className={`py-1.5 pr-3 text-right ${(fs === "live_radial") === rf.used ? "text-gold" : ""}`}>
+                  {fmt(rf.by_set[fs]?.[set]?.[key] as number | undefined, digits)}
+                </td>
+              ))}
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </Glass>
+  );
+}
+
 export function ModelTab({ total, medianAge, pairsPerSec }: { total: number; medianAge: string | null; pairsPerSec: number | null }) {
   const [m, setM] = useState<ModelMetrics | null>(null);
   const [err, setErr] = useState<string | null>(null);
@@ -353,6 +574,7 @@ export function ModelTab({ total, medianAge, pairsPerSec }: { total: number; med
             <SetSwitch value={ds} onChange={setDs} />
             <span className="text-[14px] text-muted">Trained {m.generated_utc.slice(0, 10)} · seed {m.seed}</span>
           </div>
+          {m.kpis && <KpiSection m={m} ds={ds} />}
           <Headline m={m} ds={ds} />
           <MetricsTable m={m} ds={ds} />
           <Verdicts m={m} ds={ds} />

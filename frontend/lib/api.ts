@@ -149,6 +149,71 @@ export interface Conjunction {
   ai_log10_risk?: number;
   /** False when the conjunction is outside the 2-7 day lead the model was trained on. */
   ai_in_domain?: boolean;
+  /** The live model's operating threshold on ai_p_high (validation, >= 95% recall). */
+  ai_threshold?: number;
+  /** AI probability now minus with that input group at its training median. */
+  ai_contributions?: Record<string, number>;
+  /** Separation at TCA in the protected asset's RTN frame (km). */
+  radial_km?: number;
+  in_track_km?: number;
+  cross_track_km?: number;
+  primary_tle_age_h?: number;
+  secondary_tle_age_h?: number;
+  primary_object_type?: OfficialType;
+  decision?: Decision;
+  explanation?: Explanation;
+}
+
+export type DecisionCode = "GO" | "MONITOR" | "WATCH" | "NO-GO";
+
+/** Go / No-Go recommendation (backend/decision.py). The operator decides; nothing is executed. */
+export interface Decision {
+  decision: DecisionCode;
+  label: string;
+  rank: number;
+  headline: string;
+  reasons: string[];
+  /** GO before the avoidance planner has confirmed a valid option. */
+  provisional: boolean;
+  can_manoeuvre: boolean;
+  recommended: {
+    dv_ms: number;
+    direction: string;
+    direction_label: string;
+    burn_utc: string;
+    lead_h: number;
+    new_pc: number;
+    new_miss_km: number;
+    propellant_kg?: number;
+  } | null;
+  recheck_before: { utc: string; basis: string; passed?: boolean } | null;
+  hours_to_tca: number;
+  note: string;
+}
+
+export interface ExplanationFactor {
+  key: string;
+  text: string;
+  /** Signed change in AI probability (physical factors). */
+  contribution?: number | null;
+  /** 0-1 bar length; null when the model does not use this input. */
+  bar: number | null;
+  effect: "raises" | "lowers" | "neutral" | null;
+  probability?: number;
+  in_domain?: boolean;
+}
+
+export interface Explanation {
+  factors: ExplanationFactor[];
+  method: string;
+}
+
+export interface DecisionRules {
+  config: Record<string, number | null>;
+  rules: { decision: DecisionCode; label: string; when: string }[];
+  deadline: string;
+  ai_note: string;
+  note: string;
 }
 
 export interface ScreenStats {
@@ -248,13 +313,20 @@ export const planManeuver = (req: { norad: number; secondary: number; tca_utc: s
 export const fetchReentry = (limit = 12) => getJson<ReentryItem[]>(`/reentry?limit=${limit}`);
 export const fetchSpaceWeather = () => getJson<SpaceWeather>("/spaceweather");
 export const fetchMetrics = () => getJson<Metrics>("/metrics");
+export const fetchDecisionRules = () => getJson<DecisionRules>("/decision/rules");
 
 // --------------------------------------------------------------------------- AI risk model (build step 5)
 
 export interface ScoreSet {
   n: number;
   n_high_risk: number;
+  /** Share of high-risk events (the PR-AUC of a random ranking). */
+  prevalence?: number;
   brier: number;
+  /** Expected calibration error over fixed probability bins. */
+  ece?: number;
+  /** Area under the precision-recall curve (average precision). */
+  pr_auc?: number | null;
   roc_auc: number | null;
   avg_precision: number | null;
   precision: number;
@@ -311,9 +383,20 @@ export interface ModelMetrics {
     note: string;
   };
   task: { target: string; inputs: string; high_risk: string; eligibility: string };
-  split: { train_events: number; holdout_events: number; holdout_high_risk: number; seed: number };
+  split: {
+    train_events: number;
+    train_high_risk?: number;
+    validation_events?: number;
+    validation_high_risk?: number;
+    holdout_events: number;
+    holdout_high_risk: number;
+    seed: number;
+    rule?: string;
+  };
   models: Record<ModelName, string>;
-  thresholds: { full: number; live: number };
+  thresholds: { full: number; live: number; rule?: string };
+  live_features?: string[];
+  kpis?: Kpis;
   n_features: { full: number; live: number };
   feature_mapping: { feature: string; kelvins: string; live: string }[];
   results: Record<EvalSet, Record<ModelName, ScoreSet>>;
@@ -326,6 +409,63 @@ export interface ModelMetrics {
     source: string;
   };
   verdict: Record<EvalSet, Record<"full" | "live", string[]>>;
+}
+
+export interface OperatingPoint {
+  threshold: number;
+  recall: number;
+  target_recall: number;
+  reached: boolean;
+  false_alert_rate: number;
+  alerts: number;
+  n: number;
+  n_high_risk: number;
+}
+
+type LeadCell = { recall: number; brier: number; false_alert_rate: number; pr_auc: number | null; tp: number; fn: number };
+export interface LeadRow {
+  days: number;
+  label: string;
+  n: number;
+  n_high_risk: number;
+  baseline: LeadCell;
+  full: LeadCell;
+  live: LeadCell;
+}
+
+type CalMetrics = { validation_brier: number; validation_ece: number };
+type ImbalanceVariant = CalMetrics & {
+  validation_pr_auc: number | null;
+  threshold: number;
+  validation_false_alert_rate: number;
+} & Partial<Record<EvalSet, { brier: number; ece: number; pr_auc: number | null; recall: number; false_alert_rate: number }>>;
+
+export interface Throughput {
+  measured_utc: string;
+  catalog_objects: number;
+  catalog_source?: string;
+  horizon_h: number;
+  reference: { norad: number; name: string; seconds: number; pairs_after_altitude_filter: number; pairs_per_sec: number } | null;
+  per_object_seconds: { mean: number; median: number; min: number; max: number; n: number };
+  pairs_per_sec_mean: number;
+  all_vs_all_estimate: { seconds: number; hours: number; unique_pairs: number; basis: string };
+}
+
+export interface Kpis {
+  operating_point: { rule: string; target_recall: number; validation: Record<"full" | "live", OperatingPoint> };
+  lead_time: { method: string; rows: Record<EvalSet, LeadRow[]> };
+  class_imbalance: {
+    before: string;
+    tried: string;
+    selection: string;
+    by_feature_set: Record<string, { none: ImbalanceVariant; balanced: ImbalanceVariant; balanced_uncalibrated: CalMetrics; chosen: "none" | "balanced" }>;
+  };
+  radial_feature: {
+    used: boolean;
+    rule: string;
+    by_set: Record<"live_base" | "live_radial", Record<string, Partial<ScoreSet> & { threshold?: number }>>;
+  };
+  throughput: Throughput | null;
 }
 
 export const fetchModelMetrics = () => getJson<ModelMetrics>("/model/metrics");
@@ -403,6 +543,9 @@ export interface AvoidResponse {
   assumptions: string[];
   timing_s?: { grid: number; constraint: number; total: number };
   cached?: boolean;
+  /** Final recommendation for this conjunction, with the plan taken into account. */
+  decision?: Decision;
+  explanation?: Explanation;
 }
 
 export const planAvoidance = (req: {

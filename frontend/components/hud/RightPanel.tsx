@@ -1,7 +1,7 @@
 "use client";
 
 import { Crosshair, Loader2 } from "lucide-react";
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import {
   ApiError,
   fetchReentry,
@@ -10,12 +10,15 @@ import {
   type AvoidResponse,
   type CatalogEntry,
   type Conjunction,
+  type Decision,
+  type Explanation,
   type OfficialType,
   type ReentryItem,
   type ScreenStats,
   type SpaceWeather,
 } from "@/lib/api";
 import { AvoidancePanel } from "./AvoidancePanel";
+import { DecisionBadge, DecisionCard, DecisionRulesSection } from "./DecisionCard";
 import { EdgePanel } from "./EdgePanel";
 import { DASH, Row, SectionTitle, TypeBadge } from "./Glass";
 
@@ -81,14 +84,18 @@ export function AiRisk({ c, size = 28 }: { c: Conjunction; size?: number }) {
 
 const levelColor = (c: Conjunction) => (c.level === "alert" ? "text-rose" : c.level === "watch" ? "text-gold" : "text-ivory");
 
+const conjKey = (c: Conjunction) => `${c.primary_norad}|${c.norad}|${c.tca_utc}`;
+
 function AlertCard({
   c,
+  decision,
   primary,
   active,
   now,
   onFocus,
 }: {
   c: Conjunction;
+  decision?: Decision;
   primary: CatalogEntry | null;
   active: boolean;
   now: Date | null;
@@ -105,7 +112,10 @@ function AlertCard({
     >
       <div className="flex items-baseline justify-between gap-3">
         <span className="min-w-0 truncate text-[15px] font-semibold">{c.name}</span>
-        <span className="shrink-0 font-mono text-[14px] text-muted">{c.norad}</span>
+        <span className="flex shrink-0 items-baseline gap-2">
+          {decision && <DecisionBadge d={decision} />}
+          <span className="font-mono text-[14px] text-muted">{c.norad}</span>
+        </span>
       </div>
       <div className="mt-1.5 grid grid-cols-2 gap-3">
         <div>
@@ -120,6 +130,14 @@ function AlertCard({
         <span>{c.vrel_kms.toFixed(2)} km/s</span>
         <span>σ {c.sigma_km.toFixed(2)} km (assumed)</span>
       </div>
+      {c.radial_km !== undefined && (
+        <div
+          className="mt-0.5 font-mono text-[14px] text-muted"
+          title="Separation at closest approach in the protected object's frame: radial, in-track, cross-track"
+        >
+          R {Math.abs(c.radial_km).toFixed(2)} · T {Math.abs(c.in_track_km ?? 0).toFixed(2)} · N {Math.abs(c.cross_track_km ?? 0).toFixed(2)} km
+        </div>
+      )}
       {c.ai_in_domain === false && (
         <div className="mt-1 text-[14px] leading-snug text-muted">AI risk is outside its training range here (TCA under 2 days or over 7 days away).</div>
       )}
@@ -260,6 +278,28 @@ export function RightPanel({
   const done = screenState.s === "done" ? screenState : null;
   const primary = done?.stats ? (byNorad.get(done.stats.primary_norad) ?? null) : asset;
 
+  // Final decisions from /avoid (which knows whether a valid option exists) replace the provisional ones from /screen.
+  const [finals, setFinals] = useState<Record<string, { decision: Decision; explanation?: Explanation }>>({});
+  const activeRef = useRef<Conjunction | null>(active);
+  useEffect(() => {
+    activeRef.current = active;
+  }, [active]);
+  const handlePlan = useCallback(
+    (plan: AvoidResponse | null) => {
+      onAvoidPlan(plan);
+      const a = activeRef.current;
+      if (plan?.decision && a && plan.secondary.norad === a.norad) {
+        const d = plan.decision;
+        setFinals((f) => ({ ...f, [conjKey(a)]: { decision: d, explanation: plan.explanation } }));
+      }
+    },
+    [onAvoidPlan],
+  );
+  const decisionOf = (c: Conjunction) => finals[conjKey(c)]?.decision ?? c.decision;
+  const counts = done
+    ? (["GO", "MONITOR", "WATCH", "NO-GO"] as const).map((k) => [k, done.results.filter((c) => decisionOf(c)?.decision === k).length] as const)
+    : [];
+
   return (
     <EdgePanel
       side="right"
@@ -364,12 +404,22 @@ export function RightPanel({
                   <span className="font-mono">{done.stats?.alerts ?? 0}</span> above Pc 1e−4
                 </span>
               </p>
+              <p className="mb-2 text-[14px] text-muted">
+                {counts
+                  .filter(([, n]) => n > 0)
+                  .map(([k, n]) => `${n} ${k === "NO-GO" ? "no-go" : k === "MONITOR" ? "monitor" : k.toLowerCase()}`)
+                  .join(" · ")}
+                {" · sorted by recommendation, then Pc"}
+              </p>
               <ul className="space-y-2">
                 {done.results.slice(0, SHOWN).map((c) => {
                   const isActive = active?.norad === c.norad && active.tca_utc === c.tca_utc;
+                  const fin = finals[conjKey(c)];
+                  const d = fin?.decision ?? c.decision;
                   return (
                     <li key={`${c.norad}-${c.tca_utc}`}>
-                      <AlertCard c={c} primary={primary} active={isActive} now={now} onFocus={() => onFocus(c)} />
+                      <AlertCard c={c} decision={d} primary={primary} active={isActive} now={now} onFocus={() => onFocus(c)} />
+                      {isActive && d && <DecisionCard d={d} ex={fin?.explanation ?? c.explanation} />}
                       {isActive && (
                         <AvoidancePanel
                           c={c}
@@ -377,14 +427,15 @@ export function RightPanel({
                           secondaryType={c.object_type}
                           showPath={showAvoidPath}
                           onShowPath={onShowAvoidPath}
-                          onPlan={onAvoidPlan}
+                          onPlan={handlePlan}
                         />
                       )}
                     </li>
                   );
                 })}
               </ul>
-              {done.results.length > SHOWN && <p className="mt-1.5 text-[14px] text-muted">Showing the {SHOWN} highest-Pc approaches.</p>}
+              {done.results.length > SHOWN && <p className="mt-1.5 text-[14px] text-muted">Showing the first {SHOWN} approaches.</p>}
+              <DecisionRulesSection />
               <p className="mt-2 text-[14px] leading-snug text-muted">
                 σ is assumed (0.5 km + 1 km per day of TLE age, per object). AI risk is the live model&apos;s estimate,
                 learned from ESA conjunction data, that the final risk ends at or above 1e−6; see the Model tab. Click an

@@ -15,7 +15,9 @@ Hackathon prototype (24h). Goal: a working, impressive demo, not production. Pre
 
 ## Commands
 - Backend: `cd backend && pip install -r requirements.txt && uvicorn main:app --reload --port 8000`
-- Retrain the AI risk model: `cd backend && pip install -r requirements-train.txt && python ml.py train` (writes backend/models/; ~2 min)
+- Retrain the AI risk model: `cd backend && pip install -r requirements-train.txt && python ml.py train` (writes backend/models/; ~5 min)
+- Measure screening throughput KPI: `cd backend && python ml.py throughput` (~2 min; saved to metrics.json kpis.throughput, kept across retrains)
+- On this machine use `py -3.11` for every Python command (the default python lacks our packages).
 - Frontend: `cd frontend && npm install && npm run dev` (http://localhost:3000)
 - Frontend reads `NEXT_PUBLIC_API_URL` (default http://localhost:8000)
 
@@ -35,6 +37,7 @@ Hackathon prototype (24h). Goal: a working, impressive demo, not production. Pre
 - Space weather: NOAA SWPC JSON (F10.7, Kp). Cache too.
 - Space-Track CDMs: not used.
 - AI risk model training data: ESA Kelvins Collision Avoidance Challenge CDMs (2015–2019), `backend/data/kelvins/kelvins_competition_data/` (train_data/train_data.csv; official test inputs test_data.csv + labels test_data_private.csv `true_risk`). Gitignored. https://kelvins.esa.int/collision-avoidance-challenge/ · paper arXiv:2008.03069.
+  Split 60/20/20 by event (train / validation for every choice: class weighting, radial input, ≥95%-recall threshold / held-out test). KPIs in metrics.json `kpis`.
   Kelvins task: target = `risk` (log10) of the event's last CDM; inputs only CDMs with time_to_tca ≥ 2 d; high-risk = final risk ≥ −6. Official score L = MSE_HR / F2, MSE on true-high-risk events with predictions clipped below at −6 (reproduces the published latest-risk baseline 0.694 exactly).
 
 ## API contract
@@ -45,7 +48,9 @@ Hackathon prototype (24h). Goal: a working, impressive demo, not production. Pre
 - GET  /above?lat=15.3647&lon=75.1240&radius=70&alt_m=627 → {observer, radius_deg, count, satellites: [{norad, name, int_designator, launch_date, lat, lon, alt_km}], cached}. Default observer: Hubballi (Hubli), Karnataka. The frontend lets the user change it (browser geolocation, or city search via the keyless Open-Meteo geocoding API, GeoNames data, non-commercial use; called from the browser on submit only, results cached per session) and sends lat/lon/alt_m on every request. The choice is remembered in sessionStorage.
 - GET  /passes/{norad}?lat&lon&alt_m&days=10&min_visibility=60 → {observer, norad, name, count, passes: [{start_utc, start_az_compass, max_utc, max_el, max_az_compass, end_utc, end_az_compass, mag, duration_s}], cached}
   N2YO endpoints return 503 if the key is missing, 429 at our hourly cap, 502 on upstream errors, each with a readable `detail`.
-- POST /screen {norad, horizon_h=24 (≤72), screen_km=10 (≤50), hbr_m=20} → [{norad, name, object_type, tca_utc, miss_km, vrel_kms, sigma_km, pc, alert, level, primary_norad, ai_p_high, ai_log10_risk, ai_in_domain}], sorted by Pc.
+- POST /screen {norad, horizon_h=24 (≤72), screen_km=10 (≤50), hbr_m=20} → [{norad, name, object_type, tca_utc, miss_km, radial_km, in_track_km, cross_track_km (primary's RTN frame at TCA), vrel_kms, sigma_km, primary_tle_age_h, secondary_tle_age_h, pc, alert, level, primary_norad, primary_object_type, ai_p_high, ai_log10_risk, ai_in_domain, ai_threshold, ai_contributions, decision, explanation}], sorted by decision (GO, MONITOR, WATCH, NO-GO) then Pc.
+  decision/explanation from backend/decision.py (Go / No-Go, "Recommendation — operator decides", never executed): GO from /screen is provisional until /avoid confirms a valid option; /avoid returns the final `decision` + `explanation`. Thresholds live in decision.CONFIG; GET /decision/rules → {config, rules, deadline, ai_note, note}.
+  ai_contributions = AI P(high) minus P(high) with that input group at its training median (shap.TreeExplainer does not support the calibrated model).
   ai_* = live AI model estimate (label it "AI risk (model est.)"): P(final risk ≥ 1e-6) and estimated final log10 risk; ai_in_domain false when TCA is < 2 d or > 7 d away (outside training range).
   alert = Pc ≥ 1e-4; level ∈ alert | watch (Pc ≥ 1e-6) | low. Run stats (pairs/sec etc.) go to GET /metrics → last_screen.
   Implementation notes: a perigee/apogee prefilter (±screen_km + 100 km) skips objects whose shell cannot reach the asset; objects that stay within screen_km for the whole window (docked modules/vehicles, formation flyers) are excluded and counted as co_located_excluded, not reported as conjunctions. After the 1 s refinement, the miss distance is polished within ±1 s along the local relative motion.
@@ -97,7 +102,7 @@ Hackathon prototype (24h). Goal: a working, impressive demo, not production. Pre
 
 ## Conventions
 - TypeScript strict, functional components, no class components.
-- Keep backend in few files: main.py, orbit.py, risk.py, ml.py, maneuver_opt.py.
+- Keep backend in few files: main.py, orbit.py, risk.py, ml.py, maneuver_opt.py, decision.py.
 - No auth, no database. In-memory + file cache only.
 - When unsure, ask before adding a dependency.
 ## Design reference

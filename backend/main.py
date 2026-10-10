@@ -13,6 +13,7 @@ from fastapi.middleware.gzip import GZipMiddleware
 
 from pydantic import BaseModel, Field
 
+import decision
 import maneuver_opt
 import ml
 import orbit
@@ -144,6 +145,12 @@ def screen(req: ScreenRequest) -> list[dict]:
         ml.score_conjunctions(results, datetime.fromisoformat(stats["window_start_utc"].replace("Z", "+00:00")))
     except Exception:  # never let the optional model break screening
         logging.getLogger("kesslerwatch").exception("AI risk scoring failed")
+    # Go / No-Go recommendation + explanation per alert, sorted GO, MONITOR, WATCH, NO-GO, then Pc.
+    # A GO here is provisional until /avoid confirms a valid option (that plan takes ~20 s per conjunction).
+    get_catalog()
+    movers = {primary["norad"]: primary, **{c["norad"]: _by_norad[c["norad"]] for c in results if c["norad"] in _by_norad}}
+    decision.annotate(results, datetime.now(timezone.utc), {n: decision.period_from_tle(e["tle2"]) for n, e in movers.items()})
+    stats["decisions"] = {d: sum(1 for c in results if c["decision"]["decision"] == d) for d in decision.RANK}
     _last_screen = {**stats, "primary_name": primary["name"]}
     logging.getLogger("kesslerwatch").info(
         "screen %s: %d conjunctions, %d alerts, %.1f s, %s pairs/s",
@@ -190,7 +197,29 @@ def avoid(req: AvoidRequest) -> dict:
         )
     except (ValueError, RuntimeError) as e:
         raise HTTPException(422, str(e)) from None
-    return maneuver_opt.with_fuel(core, req.mass_kg, req.isp_s)
+    out = maneuver_opt.with_fuel(core, req.mass_kg, req.isp_s)
+    # Final Go / No-Go for this conjunction, now that the planner says whether a valid option exists.
+    # Recommendation only: the operator decides; nothing is executed.
+    try:
+        p_e, s_e = resolve_object(req.primary), resolve_object(req.secondary)
+        rec = risk.describe_pair(p_e, s_e, tca.astimezone(timezone.utc), req.hbr_m)
+        if rec is not None:
+            now = datetime.now(timezone.utc)
+            ml.score_conjunctions([rec], now)
+            mover = (out.get("maneuvering") or {}).get("norad")
+            period = decision.period_from_tle((p_e if mover in (None, p_e["norad"]) else s_e)["tle2"])
+            out["decision"] = decision.evaluate(rec, out, now, period)
+            out["explanation"] = decision.explain(rec)
+            out["conjunction"] = rec
+    except Exception:  # never let the recommendation break the plan
+        logging.getLogger("kesslerwatch").exception("decision for /avoid failed")
+    return out
+
+
+@app.get("/decision/rules")
+def decision_rules() -> dict:
+    """Thresholds and rules behind the Go / No-Go recommendation (shown in the UI under "Decision rules")."""
+    return decision.rules()
 
 
 @app.get("/reentry")

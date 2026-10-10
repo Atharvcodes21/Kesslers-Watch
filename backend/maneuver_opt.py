@@ -207,7 +207,7 @@ def _plan(index, m_e: dict, o_e: dict, role: str, tca_given: datetime, target_pc
     ref = risk._refine(m, o, tca_given, 0.0, -120.0, 120.0)
     if ref is None:
         raise ValueError("SGP4 cannot propagate these objects around the given TCA.")
-    tca_off, miss0, _, vrel0, _ = ref
+    tca_off, miss0, _, vrel0, _, _ = ref
     tca = (tca_given + timedelta(seconds=tca_off)).replace(microsecond=0)
     jw, jf = risk._jd(tca, np.array([0.0]))
     tca_jd = float(jw[0] + jf[0])
