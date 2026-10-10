@@ -7,15 +7,15 @@ import {
   fetchReentry,
   fetchSpaceWeather,
   objectType,
-  planManeuver,
+  type AvoidResponse,
   type CatalogEntry,
   type Conjunction,
-  type ManeuverOption,
   type OfficialType,
   type ReentryItem,
   type ScreenStats,
   type SpaceWeather,
 } from "@/lib/api";
+import { AvoidancePanel } from "./AvoidancePanel";
 import { EdgePanel } from "./EdgePanel";
 import { DASH, Row, SectionTitle, TypeBadge } from "./Glass";
 
@@ -132,71 +132,6 @@ function AlertCard({
   );
 }
 
-function ManeuverOptions({ primary, c }: { primary: number; c: Conjunction }) {
-  const key = `${primary}|${c.norad}|${c.tca_utc}`;
-  const [store, setStore] = useState<{ key: string; rows?: ManeuverOption[]; err?: string } | null>(null);
-  const cur = store?.key === key ? store : null;
-
-  useEffect(() => {
-    let alive = true;
-    planManeuver({ norad: primary, secondary: c.norad, tca_utc: c.tca_utc })
-      .then((rows) => alive && setStore({ key, rows }))
-      .catch((e) => alive && setStore({ key, err: e instanceof ApiError ? e.message : "Could not size a maneuver." }));
-    return () => {
-      alive = false;
-    };
-  }, [key, primary, c.norad, c.tca_utc]);
-
-  return (
-    <div className="mt-3 rounded-xl bg-white/[0.03] px-3 py-2.5">
-      <h4 className="font-serif text-[18px] font-semibold">Maneuver options</h4>
-      {!cur && (
-        <p className="mt-1 flex items-center gap-2 text-[14px] text-muted">
-          <Loader2 className="h-4 w-4 animate-spin motion-reduce:animate-none" /> Sizing along-track burns…
-        </p>
-      )}
-      {cur?.err && <p className="mt-1 text-[14px] text-rose">{cur.err}</p>}
-      {cur?.rows && cur.rows.length === 0 && (
-        <p className="mt-1 text-[15px]">Closest approach is too soon for the listed lead times (≥ 30 min).</p>
-      )}
-      {cur?.rows && cur.rows.length > 0 && (
-        <>
-          <table className="mt-1.5 w-full text-left font-mono text-[14px]">
-            <thead className="text-muted">
-              <tr>
-                <th className="pb-1 font-medium">Lead</th>
-                <th className="pb-1 font-medium">Δv (m/s)</th>
-                <th className="pb-1 text-right font-medium">Miss</th>
-                <th className="pb-1 text-right font-medium">Pc</th>
-              </tr>
-            </thead>
-            <tbody>
-              {cur.rows.map((r) => (
-                <tr key={r.lead_h}>
-                  <td className="py-0.5">{r.lead_h} h</td>
-                  <td className="py-0.5">
-                    {!r.feasible
-                      ? "n/a"
-                      : r.direction === "none"
-                        ? "0"
-                        : `${Math.abs(r.dv_ms ?? 0).toFixed(3)} ${r.direction === "prograde" ? "pro" : "retro"}`}
-                  </td>
-                  <td className="py-0.5 text-right">{r.new_miss_km !== null ? `${r.new_miss_km.toFixed(1)} km` : DASH}</td>
-                  <td className="py-0.5 text-right">{r.new_pc !== null ? fmtPc(r.new_pc) : DASH}</td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-          <p className="mt-1.5 text-[14px] leading-snug text-muted">
-            Est. Along-track burn, drift Δs ≈ 3·Δv·Δt, target Pc &lt; {fmtPc(cur.rows[0].target_pc)}. Earlier burns need less Δv.
-            {cur.rows.some((r) => !r.feasible) && " n/a: the along-track shift barely moves this encounter (head-on geometry)."}
-          </p>
-        </>
-      )}
-    </div>
-  );
-}
-
 function SpaceWeatherSection() {
   const [sw, setSw] = useState<SpaceWeather | null>(null);
   const [err, setErr] = useState<string | null>(null);
@@ -293,6 +228,9 @@ export function RightPanel({
   onPick,
   activeReentry,
   onFocusReentry,
+  showAvoidPath,
+  onShowAvoidPath,
+  onAvoidPlan,
   now,
   open,
   onToggle,
@@ -308,6 +246,9 @@ export function RightPanel({
   onPick: (norad: number) => Promise<void>;
   activeReentry: number | null;
   onFocusReentry: (r: ReentryItem) => void;
+  showAvoidPath: boolean;
+  onShowAvoidPath: (v: boolean) => void;
+  onAvoidPlan: (plan: AvoidResponse | null) => void;
   now: Date | null;
   open: boolean;
   onToggle: () => void;
@@ -429,7 +370,16 @@ export function RightPanel({
                   return (
                     <li key={`${c.norad}-${c.tca_utc}`}>
                       <AlertCard c={c} primary={primary} active={isActive} now={now} onFocus={() => onFocus(c)} />
-                      {isActive && primary && <ManeuverOptions primary={primary.norad} c={c} />}
+                      {isActive && (
+                        <AvoidancePanel
+                          c={c}
+                          primary={primary}
+                          secondaryType={c.object_type}
+                          showPath={showAvoidPath}
+                          onShowPath={onShowAvoidPath}
+                          onPlan={onAvoidPlan}
+                        />
+                      )}
                     </li>
                   );
                 })}

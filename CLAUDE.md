@@ -49,7 +49,17 @@ Hackathon prototype (24h). Goal: a working, impressive demo, not production. Pre
   ai_* = live AI model estimate (label it "AI risk (model est.)"): P(final risk ≥ 1e-6) and estimated final log10 risk; ai_in_domain false when TCA is < 2 d or > 7 d away (outside training range).
   alert = Pc ≥ 1e-4; level ∈ alert | watch (Pc ≥ 1e-6) | low. Run stats (pairs/sec etc.) go to GET /metrics → last_screen.
   Implementation notes: a perigee/apogee prefilter (±screen_km + 100 km) skips objects whose shell cannot reach the asset; objects that stay within screen_km for the whole window (docked modules/vehicles, formation flyers) are excluded and counted as co_located_excluded, not reported as conjunctions. After the 1 s refinement, the miss distance is polished within ±1 s along the local relative motion.
-- POST /maneuver {norad, secondary, tca_utc, hbr_m=20} → [{lead_h, dv_ms (+ prograde / − retrograde), direction, new_miss_km, new_pc, baseline_miss_km, baseline_pc, sigma_km, target_pc=1e-6, feasible}] for leads 0.5/1/2/6/12/24 h before TCA. Estimates.
+- POST /maneuver {norad, secondary, tca_utc, hbr_m=20} → [{lead_h, dv_ms, direction, new_miss_km, new_pc, …}]. LEGACY quick along-track estimate (Δs ≈ 3·Δv·Δt); the UI uses /avoid instead.
+- POST /avoid {primary, secondary, tca (UTC ISO), mass_kg?=500, isp_s?=220, target_pc=1e-5, hbr_m=20} → collision-avoidance manoeuvre plan (backend/maneuver_opt.py):
+  {possible, reason?, note?, primary, secondary, maneuvering {norad, name, object_type, role: primary|secondary}, other, tca_utc (refined), baseline {miss_km, pc, sigma_km, vrel_kms}, target_pc,
+   burn_times [{orbits_before, burn_utc, lead_h, feasible, reason}], candidates [{id, direction (±T/±R/±N), direction_label, dv_ms, orbits_before, burn_utc, lead_h, new_miss_km, new_pc, new_tca_utc, meets_target,
+   along_track_shift_km, total_shift_km, rule_3dvt_km, constraint: passed|rejected|not_checked, new_conjunctions?, propellant_kg}], recommended (a candidate) | null, decision_deadline {burn_utc, lead_h, orbits_before, dv_ms, direction, propellant_kg} | null,
+   constraint {checked, passed, pairs_after_altitude_filter, co_located_excluded, window_start_utc, window_end_utc, existing_conjunctions}, path {original_km[], burned_km[], burn_point_km, tca_*_km, step_s, frame: TEME km},
+   inputs {mass_kg, isp_s, mass_assumed, isp_assumed}, assumptions [..], timing_s {grid, constraint, total}, cached}
+  Rules: only OBJECT_TYPE = PAYLOAD can manoeuvre (primary if payload, else secondary if payload, else possible=false "No manoeuvre possible: neither object can manoeuvre").
+  Burn model: impulsive RTN Δv; burned − unburned difference from two-body + J2 (solve_ivp DOP853, rtol 1e-11) added to the SGP4 orbit. Grid: ±T/±R/±N × 25 log-spaced 0.005–2 m/s × burn at 0.5/1/2/3 orbits before TCA (≥ now + 1 h, ≤ 72 h before TCA).
+  New miss/Pc use risk.py's Pc and σ (σ unchanged by the burn). Constraint: the ~10 cheapest target-meeting options are re-screened (risk.screen_paths, one catalog pass) from burn time to TCA + 24 h; rejected if they create a conjunction with Pc > 1e-5 or miss < 1 km absent from the unburned orbit. Recommendation = smallest passing Δv; decision deadline = latest evaluated burn time with a passing option ≤ 1 m/s.
+  Fuel (Tsiolkovsky): m0·(1 − exp(−Δv/(Isp·9.80665))); 500 kg / 220 s are ASSUMED unless given. Return-to-orbit burn not modelled. Cached 15 min per (objects, element sets, TCA, target, HBR); mass/Isp only change the fuel figure.
 - GET  /reentry?limit=25 → [{norad, name, object_type, perigee_km, apogee_km, est_days, risk, tle_age_days, overdue, basis}] (perigee < 400 km; heuristic, est.). UI shows overdue as "imminent (est.)".
 - GET  /spaceweather → {f107, f107_time_utc, kp, kp_time_utc, ap, ap_basis, source, updated, stale} (NOAA SWPC, cached 30 min; Ap = mean of last 8 three-hourly ap)
 - GET  /metrics → {objects_tracked, pairs_per_sec, median_tle_age_h, brier_score (full model, held-out events), last_screen}
@@ -87,7 +97,7 @@ Hackathon prototype (24h). Goal: a working, impressive demo, not production. Pre
 
 ## Conventions
 - TypeScript strict, functional components, no class components.
-- Keep backend in few files: main.py, orbit.py, risk.py, ml.py.
+- Keep backend in few files: main.py, orbit.py, risk.py, ml.py, maneuver_opt.py.
 - No auth, no database. In-memory + file cache only.
 - When unsure, ask before adding a dependency.
 ## Design reference

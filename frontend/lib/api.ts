@@ -329,3 +329,87 @@ export interface ModelMetrics {
 }
 
 export const fetchModelMetrics = () => getJson<ModelMetrics>("/model/metrics");
+
+// --------------------------------------------------------------------------- avoidance planning (CAM)
+
+export type BurnDirection = "+T" | "-T" | "+R" | "-R" | "+N" | "-N";
+
+export interface AvoidCandidate {
+  id: string;
+  direction: BurnDirection;
+  direction_label: string;
+  dv_ms: number;
+  orbits_before: number;
+  burn_utc: string;
+  lead_h: number;
+  new_miss_km: number;
+  new_pc: number;
+  new_tca_utc: string;
+  meets_target: boolean;
+  along_track_shift_km: number;
+  total_shift_km: number;
+  rule_3dvt_km: number;
+  /** "not_checked" unless this option was re-screened against the catalog. */
+  constraint: "passed" | "rejected" | "not_checked";
+  new_conjunctions?: { norad: number; name: string; miss_km: number; pc: number; tca_utc: string }[];
+  propellant_kg: number;
+}
+
+export interface AvoidBrief {
+  norad: number;
+  name: string;
+  object_type: OfficialType;
+  type_source?: string;
+}
+
+export interface AvoidPath {
+  start_utc: string;
+  step_s: number;
+  original_km: [number, number, number][];
+  burned_km: [number, number, number][];
+  burn_point_km: [number, number, number];
+  tca_original_km: [number, number, number];
+  tca_burned_km: [number, number, number];
+  other_at_tca_km: [number, number, number];
+  frame: string;
+}
+
+export interface AvoidResponse {
+  possible: boolean;
+  reason?: string;
+  note?: string;
+  primary: AvoidBrief;
+  secondary: AvoidBrief;
+  maneuvering?: AvoidBrief & { role: "primary" | "secondary" };
+  other?: AvoidBrief;
+  tca_utc?: string;
+  baseline?: { miss_km: number; pc: number; sigma_km: number; vrel_kms: number };
+  target_pc?: number;
+  burn_times?: { orbits_before: number; burn_utc: string; lead_h: number; feasible: boolean; reason: string | null }[];
+  candidates?: AvoidCandidate[];
+  recommended?: AvoidCandidate | null;
+  decision_deadline?: { burn_utc: string; lead_h: number; orbits_before: number; dv_ms: number; direction: BurnDirection; propellant_kg: number } | null;
+  constraint?: {
+    checked: number;
+    passed: number;
+    pairs_after_altitude_filter: number;
+    co_located_excluded: number;
+    window_start_utc: string;
+    window_end_utc: string;
+    existing_conjunctions: { norad: number; name: string; miss_km: number; pc: number }[];
+  } | null;
+  path?: AvoidPath | null;
+  inputs?: { mass_kg: number; isp_s: number; mass_assumed: boolean; isp_assumed: boolean };
+  assumptions: string[];
+  timing_s?: { grid: number; constraint: number; total: number };
+  cached?: boolean;
+}
+
+export const planAvoidance = (req: {
+  primary: number;
+  secondary: number;
+  tca: string;
+  mass_kg?: number;
+  isp_s?: number;
+  target_pc?: number;
+}) => postJson<AvoidResponse>("/avoid", req);

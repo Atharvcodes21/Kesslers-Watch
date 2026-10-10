@@ -20,6 +20,7 @@ CHUNK = 2000
 REFINE_HALF_S = 60  # refine at 1 s over ±60 s around each coarse minimum
 ALT_MARGIN_KM = 100.0  # perigee/apogee prefilter margin (mean elements vs osculating radius)
 VREL_MAX_KMS = 16.0  # upper bound on LEO relative speed, sets the coarse capture distance
+LINEAR_MARGIN_KM = 50.0  # screen_paths: straight-line pre-check margin before the 1 s refinement
 PC_ALERT = 1e-4  # "alert" (high risk)
 PC_WATCH = 1e-6  # "watch"
 PC_MANEUVER_TARGET = 1e-6  # maneuvers aim to bring Pc below this
@@ -94,14 +95,18 @@ def _risk_level(pc: float) -> str:
     return "alert" if pc >= PC_ALERT else "watch" if pc >= PC_WATCH else "low"
 
 
-def _refine(primary: Satrec, secondary: Satrec, t0: datetime, center_s: float, lo_s: float, hi_s: float):
+def _refine(primary: Satrec, secondary: Satrec, t0: datetime, center_s: float, lo_s: float, hi_s: float, perturb=None):
     """1 s grid over [center-60, center+60] ∩ [lo, hi], then sub-second polish along relative motion.
 
-    Returns (tca_s, miss_km, rel, vrel, v_primary) or None if SGP4 failed.
+    `perturb(seconds_from_t0) -> (dr, dv)` (km, km/s) is added to the primary's SGP4 state when given
+    (used for post-burn trajectories). Returns (tca_s, miss_km, rel, vrel, v_primary) or None if SGP4 failed.
     """
     tt = np.arange(max(lo_s, center_s - REFINE_HALF_S), min(hi_s, center_s + REFINE_HALF_S) + 1, 1.0)
     jd, fr = _jd(t0, tt)
     e1, r1, v1 = primary.sgp4_array(jd, fr)
+    if perturb is not None:
+        dr, dv = perturb(tt)
+        r1, v1 = r1 + dr, v1 + dv
     e2, r2, v2 = secondary.sgp4_array(jd, fr)
     d = np.linalg.norm(r2 - r1, axis=1)
     d[(e1 != 0) | (e2 != 0)] = np.inf
@@ -232,6 +237,131 @@ def screen(
         "pair_epochs_per_sec": round(pair_epochs / t_coarse) if t_coarse > 0 else None,
     }
     return results, stats
+
+
+def screen_paths(
+    index: CatalogIndex,
+    primary_entry: dict,
+    t0: datetime,
+    horizon_s: float,
+    perturbations: list,
+    screen_km: float = 10.0,
+    hbr_m: float = 20.0,
+    skip: frozenset[int] = frozenset(),
+) -> tuple[list[list[dict]], list[int], dict]:
+    """Screen several versions of one asset's trajectory against the catalog in ONE SGP4 pass.
+
+    perturbations[0] must be None (the asset as published); perturbations[k] for k >= 1 is a callable
+    f(seconds_from_t0) -> (dr, dv) added to the asset's SGP4 state (e.g. a burn's effect, zero before the burn).
+    The catalog is propagated once per chunk and compared with every path, so screening ~10 candidate
+    burns costs little more than one screen. Same coarse/refine method and Pc/σ assumptions as `screen`.
+    Objects co-located with the PUBLISHED path for the whole window (docked modules, attached vehicles)
+    are excluded from every path: they move with the asset physically, but their TLEs would not.
+    Returns (events per path, co-located NORAD IDs, stats).
+    """
+    assert perturbations and perturbations[0] is None
+    t_start = time.perf_counter()
+    hbr_km = hbr_m / 1000.0
+    pnorad = primary_entry["norad"]
+    primary = Satrec.twoline2rv(primary_entry["tle1"], primary_entry["tle2"])
+    p_epoch_jd = primary.jdsatepoch + primary.jdsatepochF
+
+    times = np.arange(0.0, horizon_s + 1e-9, COARSE_STEP_S)
+    jd, fr = _jd(t0, times)
+    ep, rp, vp = primary.sgp4_array(jd, fr)
+    if np.all(ep != 0):
+        raise ValueError("SGP4 cannot propagate the asset over this window.")
+    paths, vpaths = [rp], [vp]
+    for f in perturbations[1:]:
+        dr, dv = f(times)
+        paths.append(rp + dr)
+        vpaths.append(vp + dv)
+
+    # Altitude-band prefilter from the actual radii of all paths (burns change the shell).
+    alts = np.concatenate([np.linalg.norm(p[ep == 0], axis=1) for p in paths]) - 6378.137
+    p_lo, p_hi = alts.min() - screen_km - ALT_MARGIN_KM, alts.max() + screen_km + ALT_MARGIN_KM
+    mask = (index.apogee >= p_lo) & (index.perigee <= p_hi) & (index.norad != pnorad)
+    for n in skip:
+        if n in index.pos:
+            mask[index.pos[n]] = False
+    candidates = np.nonzero(mask)[0]
+
+    capture_km = screen_km + VREL_MAX_KMS * COARSE_STEP_S / 2
+    minima: list[list[tuple[int, float]]] = [[] for _ in paths]
+    co_located: list[int] = []
+    linear_keep_km = screen_km + LINEAR_MARGIN_KM
+    for start in range(0, len(candidates), CHUNK):
+        idx = candidates[start : start + CHUNK]
+        e, r, v = SatrecArray([index.satrecs[i] for i in idx]).sgp4(jd, fr)
+        bad = (e != 0) | (ep[None, :] != 0)
+        attached = None
+        for k, pk in enumerate(paths):
+            d = np.linalg.norm(r - pk[None, :, :], axis=2)
+            d[bad] = np.inf
+            if k == 0:
+                dmax = np.where(np.isfinite(d), d, -np.inf).max(axis=1)
+                attached = np.isfinite(dmax) & (dmax >= 0) & (dmax < screen_km)
+                co_located += [int(index.norad[i]) for i in idx[attached]]
+            d[attached] = np.inf
+            interior = (d[:, 1:-1] <= d[:, :-2]) & (d[:, 1:-1] <= d[:, 2:]) & (d[:, 1:-1] < capture_km)
+            rows, cols = np.nonzero(interior)
+            cols = cols + 1
+            for edge, nb in ((0, 1), (len(times) - 1, len(times) - 2)):
+                hit = np.nonzero((d[:, edge] < capture_km) & (d[:, edge] <= d[:, nb]))[0]
+                rows = np.concatenate([rows, hit])
+                cols = np.concatenate([cols, np.full(len(hit), edge)])
+            if len(rows) == 0:
+                continue
+            # Cheap straight-line closest approach within ±1 coarse step of the sample; only minima that
+            # could come within screen_km (+ margin for curvature) get the full 1 s refinement.
+            rel = r[rows, cols] - pk[cols]
+            vrel = v[rows, cols] - vpaths[k][cols]
+            tau = np.clip(-np.einsum("ij,ij->i", rel, vrel) / np.maximum(np.einsum("ij,ij->i", vrel, vrel), 1e-12), -COARSE_STEP_S, COARSE_STEP_S)
+            dlin = np.linalg.norm(rel + vrel * tau[:, None], axis=1)
+            keep = dlin < linear_keep_km
+            minima[k] += [(int(idx[a]), float(times[b])) for a, b in zip(rows[keep], cols[keep])]
+    t_coarse = time.perf_counter() - t_start
+
+    out: list[list[dict]] = []
+    for k, mins in enumerate(minima):
+        f = perturbations[k]
+        events: dict[tuple[int, int], dict] = {}
+        for i, center in mins:
+            ref = _refine(primary, index.satrecs[i], t0, center, 0.0, horizon_s, perturb=f)
+            if ref is None:
+                continue
+            tca_s, miss, _, vrel, _ = ref
+            if miss > screen_km:
+                continue
+            key = (i, int(round(tca_s / 300)))
+            if key in events and events[key]["miss_km"] <= miss:
+                continue
+            jw, jf = _jd(t0, np.array([tca_s]))
+            tca_jd = float(jw[0] + jf[0])
+            sig = math.hypot(sigma_km(tca_jd - p_epoch_jd), sigma_km(tca_jd - index.epoch_jd[i]))
+            sec = index.entries[i]
+            events[key] = {
+                "norad": sec["norad"],
+                "name": sec["name"],
+                "object_type": sec["object_type"],
+                "tca_utc": _iso(t0 + timedelta(seconds=tca_s)),
+                "miss_km": round(miss, 3),
+                "vrel_kms": round(float(np.linalg.norm(vrel)), 3),
+                "sigma_km": round(sig, 3),
+                "pc": collision_probability(miss, sig, hbr_km),
+            }
+        out.append(sorted(events.values(), key=lambda c: (-c["pc"], c["miss_km"])))
+    stats = {
+        "window_start_utc": _iso(t0),
+        "horizon_h": round(horizon_s / 3600.0, 2),
+        "paths": len(paths),
+        "objects_in_catalog": len(index.entries) - (1 if pnorad in index.pos else 0),
+        "pairs_after_altitude_filter": int(len(candidates)),
+        "co_located_excluded": len(co_located),
+        "seconds": round(time.perf_counter() - t_start, 2),
+        "coarse_seconds": round(t_coarse, 2),
+    }
+    return out, co_located, stats
 
 
 # --------------------------------------------------------------------------- maneuver

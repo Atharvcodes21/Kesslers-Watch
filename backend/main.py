@@ -13,6 +13,7 @@ from fastapi.middleware.gzip import GZipMiddleware
 
 from pydantic import BaseModel, Field
 
+import maneuver_opt
 import ml
 import orbit
 import risk
@@ -166,6 +167,30 @@ def maneuver(req: ManeuverRequest) -> list[dict]:
         return risk.maneuver(resolve_object(req.norad), resolve_object(req.secondary), tca.astimezone(timezone.utc), req.hbr_m)
     except ValueError as e:
         raise HTTPException(422, str(e)) from None
+
+
+class AvoidRequest(BaseModel):
+    primary: int = Field(gt=0, description="Protected asset (NORAD ID)")
+    secondary: int = Field(gt=0, description="The other object (NORAD ID)")
+    tca: datetime = Field(description="Time of closest approach, UTC (from /screen)")
+    mass_kg: float | None = Field(None, gt=0, le=1_000_000, description="Spacecraft wet mass; default 500 kg (assumed)")
+    isp_s: float | None = Field(None, gt=0, le=10_000, description="Specific impulse; default 220 s (hydrazine, assumed)")
+    target_pc: float = Field(maneuver_opt.DEFAULT_TARGET_PC, gt=0, lt=1)
+    hbr_m: float = Field(20, gt=0, le=500)
+
+
+@app.post("/avoid")
+def avoid(req: AvoidRequest) -> dict:
+    """Collision-avoidance manoeuvre plan for the payload in this conjunction (see maneuver_opt.py). Estimates."""
+    tca = req.tca if req.tca.tzinfo else req.tca.replace(tzinfo=timezone.utc)
+    try:
+        core = maneuver_opt.plan(
+            get_index(), resolve_object(req.primary), resolve_object(req.secondary), tca.astimezone(timezone.utc),
+            target_pc=req.target_pc, hbr_m=req.hbr_m,
+        )
+    except (ValueError, RuntimeError) as e:
+        raise HTTPException(422, str(e)) from None
+    return maneuver_opt.with_fuel(core, req.mass_kg, req.isp_s)
 
 
 @app.get("/reentry")

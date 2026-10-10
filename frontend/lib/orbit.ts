@@ -25,6 +25,11 @@ function eciToScene(p: { x: number; y: number; z: number }): Vec3 {
   return [p.x / R_EARTH_KM, p.z / R_EARTH_KM, -p.y / R_EARTH_KM];
 }
 
+/** TEME/ECI km (as returned by the backend) -> scene Earth radii. */
+export function temeToScene(p: [number, number, number]): Vec3 {
+  return eciToScene({ x: p[0], y: p[1], z: p[2] });
+}
+
 /** Scene-space position at `date`, or null if SGP4 fails (e.g. decayed). */
 export function positionAt(satrec: SatRec, date: Date): Vec3 | null {
   const p = propagate(satrec, date)?.position;

@@ -11,7 +11,7 @@ const RING_PX = 26; // on-screen diameter at rest
 const scratch = new THREE.Vector3();
 
 /** Soft, slowly pulsing rose ring marking the point of closest approach (constant pixel size). */
-export function TcaMarker({ point }: { point: Vec3 }) {
+export function TcaMarker({ point, color = PALETTE.rose }: { point: Vec3; color?: string }) {
   const group = useRef<THREE.Group>(null);
   const halo = useRef<THREE.MeshBasicMaterial>(null);
   const reduced = useRef(false);
@@ -36,13 +36,13 @@ export function TcaMarker({ point }: { point: Vec3 }) {
       <group ref={group}>
         <mesh renderOrder={6}>
           <ringGeometry args={[0.82, 1, 64]} />
-          <meshBasicMaterial color={PALETTE.rose} transparent opacity={0.85} depthTest={false} depthWrite={false} toneMapped={false} />
+          <meshBasicMaterial color={color} transparent opacity={0.85} depthTest={false} depthWrite={false} toneMapped={false} />
         </mesh>
         <mesh renderOrder={5} scale={1.9}>
           <ringGeometry args={[0.45, 1, 64]} />
           <meshBasicMaterial
             ref={halo}
-            color={PALETTE.rose}
+            color={color}
             transparent
             opacity={0.18}
             blending={THREE.AdditiveBlending}

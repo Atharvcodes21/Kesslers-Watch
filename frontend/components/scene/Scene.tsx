@@ -1,5 +1,6 @@
 "use client";
 
+import { Line } from "@react-three/drei";
 import { Canvas } from "@react-three/fiber";
 import { Suspense } from "react";
 import type { CatalogEntry } from "@/lib/api";
@@ -27,6 +28,8 @@ export interface SceneFocus {
   tcaPoint: Vec3 | null;
   /** Where the camera glides to and holds; null = follow the selection as usual. */
   cameraPoint: Vec3 | null;
+  /** Planned avoidance burn: original vs post-burn path from the burn point to TCA + 30 min. */
+  avoid?: { original: Vec3[]; burned: Vec3[]; burnPoint: Vec3 } | null;
 }
 
 export interface SceneProps {
@@ -85,6 +88,14 @@ export default function Scene({
         )}
         {focus?.line && <ConjunctionLine a={focus.line[0]} b={focus.line[1]} />}
         {focus?.tcaPoint && <TcaMarker point={focus.tcaPoint} />}
+        {focus?.avoid && (
+          <group>
+            <Line points={focus.avoid.original} color={PALETTE.ivory} lineWidth={1} transparent opacity={0.35} depthWrite={false} />
+            <Line points={focus.avoid.burned} color={PALETTE.gold} lineWidth={5} transparent opacity={0.14} depthWrite={false} />
+            <Line points={focus.avoid.burned} color={PALETTE.gold} lineWidth={1.6} transparent opacity={0.95} depthWrite={false} />
+            <TcaMarker point={focus.avoid.burnPoint} color={PALETTE.gold} />
+          </group>
+        )}
         <CameraRig
           target={selected}
           targetAt={selectedAt}

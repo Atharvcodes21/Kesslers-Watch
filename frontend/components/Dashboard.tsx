@@ -13,11 +13,12 @@ import {
   screen,
   type CatalogEntry,
   type CatalogStatus,
+  type AvoidResponse,
   type Conjunction,
   type ObjectType,
   type ReentryItem,
 } from "@/lib/api";
-import { medianTleAgeHours, positionAt, toSatrec, type Vec3 } from "@/lib/orbit";
+import { medianTleAgeHours, positionAt, temeToScene, toSatrec, type Vec3 } from "@/lib/orbit";
 import { useObserver } from "@/lib/observer";
 import { PALETTE } from "@/lib/theme";
 import { simClock, simNow, useSimNow } from "@/lib/simClock";
@@ -131,6 +132,10 @@ export function Dashboard() {
 
   /** Focus mode: one conjunction (asset + threat) or one re-entry object; everything else fades. */
   const [focus, setFocus] = useState<Focus | null>(null);
+  // Avoidance plan of the focused conjunction (from the Screening panel) and the globe toggle.
+  const [avoidPlan, setAvoidPlan] = useState<AvoidResponse | null>(null);
+  const [showAvoidPath, setShowAvoidPath] = useState(true);
+  const onAvoidPlan = useCallback((p: AvoidResponse | null) => setAvoidPlan(p), []);
   const [toast, setToast] = useState<ToastMsg | null>(null);
 
   const select = useCallback((norad: number) => {
@@ -249,6 +254,18 @@ export function Dashboard() {
     return s as ReadonlySet<number>;
   }, [screenState]);
 
+  // Only draw a plan that belongs to the conjunction in focus.
+  const avoidPath = useMemo((): SceneFocus["avoid"] => {
+    const p = avoidPlan?.path;
+    if (!showAvoidPath || !p || focus?.kind !== "conjunction") return null;
+    if (avoidPlan.primary.norad !== focus.c.primary_norad || avoidPlan.secondary.norad !== focus.c.norad) return null;
+    return {
+      original: p.original_km.map(temeToScene),
+      burned: p.burned_km.map(temeToScene),
+      burnPoint: temeToScene(p.burn_point_km),
+    };
+  }, [avoidPlan, showAvoidPath, focus]);
+
   const sceneFocus = useMemo((): SceneFocus | null => {
     if (!focus) return null;
     if (focus.kind === "conjunction") {
@@ -264,6 +281,7 @@ export function Dashboard() {
         line: a && b ? [a, b] : null,
         tcaPoint: focus.tcaPoint,
         cameraPoint: focus.tcaPoint,
+        avoid: avoidPath,
       };
     }
     const e = byNorad.get(focus.item.norad);
@@ -275,7 +293,7 @@ export function Dashboard() {
       tcaPoint: null,
       cameraPoint: null,
     };
-  }, [focus, byNorad]);
+  }, [focus, byNorad, avoidPath]);
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
@@ -369,6 +387,9 @@ export function Dashboard() {
             onFocus={(c) => void focusConjunction(c)}
             activeReentry={focus?.kind === "reentry" ? focus.item.norad : null}
             onFocusReentry={(r) => void focusReentry(r)}
+            showAvoidPath={showAvoidPath}
+            onShowAvoidPath={setShowAvoidPath}
+            onAvoidPlan={onAvoidPlan}
             onPick={lookup}
             now={now}
             open={rightOpen === "screening"}
