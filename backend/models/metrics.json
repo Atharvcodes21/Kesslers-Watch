@@ -1413,153 +1413,177 @@
       }
     },
     "throughput": {
-      "measured_utc": "2026-10-10T11:55:22Z",
-      "catalog_objects": 32077,
-      "horizon_h": 24.0,
+      "measured_utc": "2026-10-10T12:55:48Z",
+      "catalog_objects": 32076,
+      "horizon_h": 72.0,
       "screen_km": 10.0,
       "reference": {
         "norad": 25544,
         "name": "ISS (ZARYA)",
-        "perigee_km": 415.7,
-        "apogee_km": 424.8,
-        "seconds": 9.68,
+        "seconds": 32.9,
+        "seconds_split": {
+          "propagation": 20.97,
+          "kdtree": 11.7,
+          "refine": 0.22
+        },
         "pairs_after_altitude_filter": 14031,
-        "pairs_per_sec": 3313
+        "pairs_per_sec": 975,
+        "conjunctions": 15
       },
-      "sample_runs": [
-        {
-          "norad": 25544,
-          "name": "ISS (ZARYA)",
-          "perigee_km": 415.7,
-          "apogee_km": 424.8,
-          "seconds": 9.68,
-          "pairs_after_altitude_filter": 14031,
-          "pairs_per_sec": 3313
+      "watchlist": {
+        "objects": 42,
+        "seconds": 74.04,
+        "seconds_split": {
+          "propagation": 38.78,
+          "kdtree": 26.1,
+          "refine": 9.09
         },
-        {
-          "norad": 43266,
-          "name": "CZ-4C DEB",
-          "perigee_km": 500.0,
-          "apogee_km": 524.3,
-          "seconds": 11.8,
-          "pairs_after_altitude_filter": 16033,
-          "pairs_per_sec": 2719
-        },
-        {
-          "norad": 4681,
-          "name": "THORAD AGENA D DEB",
-          "perigee_km": 1044.0,
-          "apogee_km": 1410.6,
-          "seconds": 6.17,
-          "pairs_after_altitude_filter": 8472,
-          "pairs_per_sec": 5201
-        },
-        {
-          "norad": 59605,
-          "name": "STARLINK-31767",
-          "perigee_km": 482.4,
-          "apogee_km": 483.7,
-          "seconds": 9.69,
-          "pairs_after_altitude_filter": 14814,
-          "pairs_per_sec": 3309
-        },
-        {
-          "norad": 100274,
-          "name": "STARLINK-37696",
-          "perigee_km": 461.7,
-          "apogee_km": 463.7,
-          "seconds": 9.99,
-          "pairs_after_altitude_filter": 15035,
-          "pairs_per_sec": 3210
-        },
-        {
-          "norad": 63012,
-          "name": "STARLINK-11449",
-          "perigee_km": 354.8,
-          "apogee_km": 357.3,
-          "seconds": 4.98,
-          "pairs_after_altitude_filter": 7683,
-          "pairs_per_sec": 6439
-        },
-        {
-          "norad": 41846,
-          "name": "CZ-11 DEB",
-          "perigee_km": 491.8,
-          "apogee_km": 924.1,
-          "seconds": 15.8,
-          "pairs_after_altitude_filter": 24751,
-          "pairs_per_sec": 2031
-        },
-        {
-          "norad": 11145,
-          "name": "OPS 9442 (DSCS 2-12)",
-          "perigee_km": 36288.4,
-          "apogee_km": 36326.5,
-          "seconds": 0.58,
-          "pairs_after_altitude_filter": 715,
-          "pairs_per_sec": 55184
-        },
-        {
-          "norad": 66135,
-          "name": "STARLINK-34852",
-          "perigee_km": 461.4,
-          "apogee_km": 463.9,
-          "seconds": 9.27,
-          "pairs_after_altitude_filter": 15041,
-          "pairs_per_sec": 3459
-        },
-        {
-          "norad": 42648,
-          "name": "DELTA 1 DEB",
-          "perigee_km": 891.2,
-          "apogee_km": 1203.0,
-          "seconds": 7.08,
-          "pairs_after_altitude_filter": 10772,
-          "pairs_per_sec": 4530
-        },
-        {
-          "norad": 54151,
-          "name": "GONETS-M 24",
-          "perigee_km": 1481.5,
-          "apogee_km": 1507.2,
-          "seconds": 2.56,
-          "pairs_after_altitude_filter": 3736,
-          "pairs_per_sec": 12514
-        },
-        {
-          "norad": 196,
-          "name": "MIDAS 3 DEB",
-          "perigee_km": 3374.2,
-          "apogee_km": 3545.8,
-          "seconds": 1.2,
-          "pairs_after_altitude_filter": 1483,
-          "pairs_per_sec": 26770
-        },
-        {
-          "norad": 52560,
-          "name": "STARLINK-3956",
-          "perigee_km": 458.4,
-          "apogee_km": 460.9,
-          "seconds": 9.42,
-          "pairs_after_altitude_filter": 14966,
-          "pairs_per_sec": 3407
-        }
-      ],
-      "per_object_seconds": {
-        "mean": 7.56,
-        "median": 9.27,
-        "min": 0.58,
-        "max": 15.8,
-        "n": 13
+        "objects_propagated": 25730,
+        "pairs_checked": 484940,
+        "conjunctions": 2066,
+        "seconds_per_object": 1.76
       },
-      "pairs_per_sec_mean": 10160,
       "all_vs_all_estimate": {
-        "seconds": 242354,
-        "hours": 67.3,
-        "unique_pairs": 514450926,
-        "basis": "est.: catalog size \u00d7 mean measured per-object screen time (serial, one core, no pair sharing)"
+        "seconds": 4841,
+        "hours": 1.34,
+        "unique_pairs": 514418850,
+        "slice": {
+          "slice_h": 1.0,
+          "time_steps": 60,
+          "objects": 32076,
+          "capture_radius_km": 490.0,
+          "kdtree_pairs_found": 19226557,
+          "refine_candidates": 544191,
+          "seconds": {
+            "propagation": 0.66,
+            "kdtree_and_filter": 6.72,
+            "per_refine": 0.00011,
+            "total_measured": 7.48
+          }
+        },
+        "basis": "est.: measured 1 h slice of an all-vs-all cKDTree screen (query_pairs per 60 s step), scaled to 72 h; serial, one core"
       },
       "catalog_source": "space-track"
+    },
+    "decision_levels": {
+      "method": "Pc = 10^risk of the latest ESA CDM at least 2 days before TCA; miss = its miss_distance; AI = live model on the same CDM. Truth: final risk \u2265 1e-6. ESA CDMs carry no TLE age, so the stale-data rule never fires. GO also needs a valid avoidance plan, which cannot be checked on historical data; without one GO becomes WATCH, so 'WATCH or above' counts every GO or WATCH trigger.",
+      "thresholds": {
+        "ai_p_high_threshold": 0.0033769563080060907,
+        "watch_pc": 1e-05,
+        "watch_ai_min_pc": 1e-06,
+        "go_pc": 0.0001,
+        "go_ai_final_risk": 0.0001
+      },
+      "levels": {
+        "early_flag": "AI early flag: P(high-risk) \u2265 the 95%-recall threshold (tag only)",
+        "watch_or_above": "WATCH or above under the two-stage rule",
+        "pc_watch_only": "For comparison: Pc \u2265 1e-5 alone (no AI)",
+        "previous_rule": "For comparison: the previous rule (AI flag alone, or Pc / AI final risk \u2265 1e-5, raised WATCH)"
+      },
+      "by_set": {
+        "holdout": {
+          "n": 1779,
+          "n_high_risk": 19,
+          "early_flag": {
+            "recall": 1.0,
+            "false_alert_rate": 0.225,
+            "precision": 0.04578313253012048,
+            "alerts": 415,
+            "tp": 19,
+            "fp": 396,
+            "fn": 0,
+            "tn": 1364
+          },
+          "watch_or_above": {
+            "recall": 0.7368421052631579,
+            "false_alert_rate": 0.02727272727272727,
+            "precision": 0.22580645161290322,
+            "alerts": 62,
+            "tp": 14,
+            "fp": 48,
+            "fn": 5,
+            "tn": 1712
+          },
+          "pc_watch_only": {
+            "recall": 0.47368421052631576,
+            "false_alert_rate": 0.0125,
+            "precision": 0.2903225806451613,
+            "alerts": 31,
+            "tp": 9,
+            "fp": 22,
+            "fn": 10,
+            "tn": 1738
+          },
+          "previous_rule": {
+            "recall": 1.0,
+            "false_alert_rate": 0.225,
+            "precision": 0.04578313253012048,
+            "alerts": 415,
+            "tp": 19,
+            "fp": 396,
+            "fn": 0,
+            "tn": 1364
+          },
+          "early_flag_only": 353,
+          "watch_or_above_by_trigger": {
+            "pc": 28,
+            "ai_backed_by_pc": 31,
+            "go_threshold": 3
+          },
+          "go_from_ai_only": 0
+        },
+        "official_test": {
+          "n": 2167,
+          "n_high_risk": 150,
+          "early_flag": {
+            "recall": 0.96,
+            "false_alert_rate": 0.2131879028259792,
+            "precision": 0.2508710801393728,
+            "alerts": 574,
+            "tp": 144,
+            "fp": 430,
+            "fn": 6,
+            "tn": 1587
+          },
+          "watch_or_above": {
+            "recall": 0.7666666666666667,
+            "false_alert_rate": 0.031234506693108576,
+            "precision": 0.6460674157303371,
+            "alerts": 178,
+            "tp": 115,
+            "fp": 63,
+            "fn": 35,
+            "tn": 1954
+          },
+          "pc_watch_only": {
+            "recall": 0.34,
+            "false_alert_rate": 0.010907288051561725,
+            "precision": 0.6986301369863014,
+            "alerts": 73,
+            "tp": 51,
+            "fp": 22,
+            "fn": 99,
+            "tn": 1995
+          },
+          "previous_rule": {
+            "recall": 0.96,
+            "false_alert_rate": 0.2131879028259792,
+            "precision": 0.2508710801393728,
+            "alerts": 574,
+            "tp": 144,
+            "fp": 430,
+            "fn": 6,
+            "tn": 1587
+          },
+          "early_flag_only": 396,
+          "watch_or_above_by_trigger": {
+            "pc": 50,
+            "ai_backed_by_pc": 105,
+            "go_threshold": 23
+          },
+          "go_from_ai_only": 0
+        }
+      }
     }
   },
   "published": {

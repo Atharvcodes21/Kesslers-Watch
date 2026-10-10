@@ -26,7 +26,7 @@ const STEPS = [
   {
     n: "I",
     title: "Gather",
-    body: "The latest element sets for every tracked object still in orbit come from Space-Track, refreshed at most every four hours, with CelesTrak as a fallback.",
+    body: "The latest element sets for every tracked object still in orbit come from Space-Track, refreshed at most once an hour, with CelesTrak as a fallback.",
   },
   {
     n: "II",
@@ -69,7 +69,20 @@ export function AboutTab() {
             </li>
           ))}
         </ol>
-        <p className="mt-5 text-[14px] text-muted">Step III is in progress; screening and burn estimates arrive in the next build steps.</p>
+      </Glass>
+
+      <Glass className="p-8">
+        <h2 className="heading mb-3">Sentinel</h2>
+        <p className="max-w-[62ch] text-[17px] text-ivory">
+          A monitor that never sleeps. Every hour it screens the watchlist (the ISS, Tiangong, Hubble, India&apos;s active payloads in
+          low orbit, and anything you add) against the whole catalog for the next 72 hours, raises alerts on its own and attaches the
+          avoidance burn and its fuel cost. An AI flag alone never escalates: physics has to back it, and a GO is only confirmed by a
+          second data update or by Pc and the AI agreeing independently. Every alert is a recommendation; the operator decides.
+        </p>
+        <p className="mt-3 max-w-[62ch] text-[14px] text-muted">
+          Replay plays a real high-risk ESA conjunction (2015–2019, anonymised) through the same AI, decision and guard, clearly
+          marked as historical.
+        </p>
       </Glass>
 
       <Glass className="p-8">
@@ -77,8 +90,8 @@ export function AboutTab() {
         <ul>
           <Item title="Space-Track GP catalog" status="in-use">
             Primary source: the latest general perturbations element set for every on-orbit object (no decay date,
-            epoch within 10 days), with the official object type. Fetched at most every 4 hours, within Space-Track&apos;s
-            published rate limits. Single objects are looked up by NORAD ID on demand.
+            epoch within 10 days), with the official object type. Fetched at most once an hour, within Space-Track&apos;s
+            published rate limits. SATCAT (country of origin) builds Sentinel&apos;s Indian watchlist, at most once a day. Single objects are looked up by NORAD ID on demand.
           </Item>
           <Item title="CelesTrak GP element sets" status="in-use">
             Fallback when Space-Track credentials are missing or a request fails: groups stations, active and four
@@ -93,10 +106,11 @@ export function AboutTab() {
             test the AI risk model. See the Model tab.
           </Item>
           <Item title="NOAA SWPC space weather" status="in-use">
-            Solar flux F10.7 and geomagnetic Kp / Ap (cached 30 min), which drive upper-atmosphere density and drag.
+            Solar flux F10.7 and geomagnetic Kp / Ap (cached 30 min), which drive upper-atmosphere density and drag, plus the
+            27-day F10.7 outlook used to scale re-entry estimates.
           </Item>
           <Item title="Space-Track conjunction messages" status="soon">
-            Not used yet; conjunctions will be screened from element sets.
+            Not used; conjunctions are screened from element sets.
           </Item>
         </ul>
       </Glass>
@@ -113,16 +127,21 @@ export function AboutTab() {
             uncertainty (non-central χ² with two degrees of freedom).
           </Item>
           <Item title="Avoidance burns" status="assumption">
-            Along-track drift is approximated as Δs ≈ 3·Δv·Δt; burn sizes are estimates (est.).
+            Impulsive burns in six directions, their effect propagated with two-body + J2 and added to SGP4; 500 kg and Isp 220 s
+            are assumed for fuel unless given. Every Δv and propellant figure is an estimate (est.).
           </Item>
           <Item title="Re-entry dates" status="assumption">
-            Lifetimes come from perigee height and the mean-motion derivative: a heuristic, labelled est., not a
-            certified prediction.
+            Lifetimes come from perigee height and the mean-motion derivative, scaled by NOAA&apos;s 27-day F10.7 outlook as
+            (recent ÷ forecast)^1.5, an assumed density sensitivity: a heuristic, labelled est., not a certified prediction.
           </Item>
           <Item title="Object type" status="assumption">
             Official Space-Track OBJECT_TYPE when available. With the CelesTrak fallback it is inferred from names
             (DEB = debris, R/B = rocket body, otherwise payload) and labelled &ldquo;inferred&rdquo;. Pasted TLEs are
             typed Unknown.
+          </Item>
+          <Item title="Sentinel confidence" status="assumption">
+            Approaches more than 48 hours out are marked lower confidence; an element set older than 3 days caps an alert at WATCH
+            (stale data). Indian payloads count as active when CelesTrak lists them as active.
           </Item>
           <Item title="Smooth motion between updates" status="assumption">
             Positions are recomputed with SGP4 every 0.2–1 s; in between, each point is extrapolated with two-body

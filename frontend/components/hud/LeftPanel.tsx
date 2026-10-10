@@ -340,11 +340,13 @@ function Selected({
   now,
   observer,
   onClear,
+  onAddToSentinel,
 }: {
   entry: CatalogEntry;
   now: Date | null;
   observer: Observer;
   onClear: () => void;
+  onAddToSentinel?: (norad: number) => void;
 }) {
   const satrec = useMemo(() => toSatrec(entry), [entry]);
   const altKm = useMemo(() => {
@@ -383,6 +385,11 @@ function Selected({
       <p className="mt-1.5 text-[14px] leading-snug text-muted">
         Assumed σ: 0.5 km + 1 km per day of element age (TLEs carry no covariance).
       </p>
+      {onAddToSentinel && (
+        <button type="button" className="quiet-btn mt-2.5" onClick={() => onAddToSentinel(entry.norad)}>
+          Add to Sentinel
+        </button>
+      )}
       <VisiblePasses norad={entry.norad} observer={observer} />
     </div>
   );
@@ -405,6 +412,7 @@ export function LeftPanel({
   onLookup,
   onAddPasted,
   onClear,
+  onAddToSentinel,
   open,
   onToggle,
   top,
@@ -424,6 +432,7 @@ export function LeftPanel({
   onLookup: (norad: number) => Promise<void>;
   onAddPasted: (entry: CatalogEntry) => void;
   onClear: () => void;
+  onAddToSentinel?: (norad: number) => void;
   open: boolean;
   onToggle: () => void;
   top: number;
@@ -439,7 +448,7 @@ export function LeftPanel({
       <PasteTle onAdd={onAddPasted} />
       <div className="divider my-4" />
       {selected ? (
-        <Selected entry={selected} now={now} observer={observer} onClear={onClear} />
+        <Selected entry={selected} now={now} observer={observer} onClear={onClear} onAddToSentinel={onAddToSentinel} />
       ) : (
         <p className="text-[17px] text-ivory">Click any point on the globe, or search, to inspect it.</p>
       )}

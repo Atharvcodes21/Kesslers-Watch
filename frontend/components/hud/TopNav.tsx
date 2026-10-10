@@ -1,8 +1,9 @@
-export type Tab = "live" | "model" | "about";
+export type Tab = "live" | "sentinel" | "model" | "about";
 export type CatalogStatus = "loading" | "ok" | "error";
 
 const TABS: { id: Tab; label: string }[] = [
   { id: "live", label: "Live" },
+  { id: "sentinel", label: "Sentinel" },
   { id: "model", label: "Model" },
   { id: "about", label: "About" },
 ];

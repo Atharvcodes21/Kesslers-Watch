@@ -188,6 +188,13 @@ export interface Decision {
   } | null;
   recheck_before: { utc: string; basis: string; passed?: boolean } | null;
   hours_to_tca: number;
+  /** Stage 1: AI P(high-risk) at or above the 95%-recall threshold. */
+  ai_flag?: boolean;
+  /** AI flag without physics confirmation: decision stays NO-GO, tagged "AI early flag". */
+  early_flag?: boolean;
+  /** Either TLE older than 3 days. */
+  stale?: boolean;
+  tags?: string[];
   note: string;
 }
 
@@ -210,6 +217,7 @@ export interface Explanation {
 
 export interface DecisionRules {
   config: Record<string, number | null>;
+  stages?: { stage: number; title: string; when: string }[];
   rules: { decision: DecisionCode; label: string; when: string }[];
   deadline: string;
   ai_note: string;
@@ -254,7 +262,13 @@ export interface ReentryItem {
   object_type: OfficialType;
   perigee_km: number;
   apogee_km: number;
+  /** Space-weather adjusted when the NOAA 27-day outlook is available (est.). */
   est_days: number;
+  /** Mean-motion-derivative heuristic alone (est.). */
+  est_days_raw?: number;
+  sw_factor?: number | null;
+  f107_recent?: number | null;
+  f107_forecast_mean?: number | null;
   risk: "high" | "medium" | "low";
   tle_age_days: number;
   overdue: boolean;
@@ -268,9 +282,11 @@ export interface SpaceWeather {
   kp_time_utc: string;
   ap: number | null;
   ap_basis: string;
+  f107_27d_mean?: number | null;
   source: string;
   updated: string;
   stale: boolean;
+  outlook?: { issued: string | null; source: string; stale: boolean; f107_mean: number | null; days: { date: string; f107: number; ap: number; kp_max: number }[] } | null;
 }
 
 export interface Metrics {
@@ -446,9 +462,41 @@ export interface Throughput {
   catalog_source?: string;
   horizon_h: number;
   reference: { norad: number; name: string; seconds: number; pairs_after_altitude_filter: number; pairs_per_sec: number } | null;
-  per_object_seconds: { mean: number; median: number; min: number; max: number; n: number };
-  pairs_per_sec_mean: number;
+  /** Whole Sentinel watchlist in one shared cKDTree pass. */
+  watchlist?: { objects: number; seconds: number; seconds_per_object: number; conjunctions: number; pairs_checked: number };
+  /** Older measurements only. */
+  per_object_seconds?: { mean: number; median: number; min: number; max: number; n: number };
+  pairs_per_sec_mean?: number;
   all_vs_all_estimate: { seconds: number; hours: number; unique_pairs: number; basis: string };
+}
+
+export interface Confusion {
+  recall: number | null;
+  false_alert_rate: number | null;
+  precision: number | null;
+  alerts: number;
+  tp: number;
+  fp: number;
+  fn: number;
+  tn: number;
+}
+
+export type DecisionLevel = "early_flag" | "watch_or_above" | "pc_watch_only" | "previous_rule";
+
+export interface DecisionLevels {
+  method: string;
+  thresholds: Record<string, number>;
+  levels: Record<DecisionLevel, string>;
+  by_set: Record<
+    EvalSet,
+    Record<DecisionLevel, Confusion> & {
+      n: number;
+      n_high_risk: number;
+      early_flag_only: number;
+      go_from_ai_only: number;
+      watch_or_above_by_trigger: { pc: number; ai_backed_by_pc: number; go_threshold: number };
+    }
+  >;
 }
 
 export interface Kpis {
@@ -466,6 +514,7 @@ export interface Kpis {
     by_set: Record<"live_base" | "live_radial", Record<string, Partial<ScoreSet> & { threshold?: number }>>;
   };
   throughput: Throughput | null;
+  decision_levels?: DecisionLevels;
 }
 
 export const fetchModelMetrics = () => getJson<ModelMetrics>("/model/metrics");
@@ -556,3 +605,198 @@ export const planAvoidance = (req: {
   isp_s?: number;
   target_pc?: number;
 }) => postJson<AvoidResponse>("/avoid", req);
+
+// --------------------------------------------------------------------------- Sentinel (continuous monitor)
+
+export type Tier = "Crewed" | "Critical" | "Standard";
+export type SentinelStatusCode = "NEW" | "WATCH" | "CONFIRMED GO" | "RESOLVED";
+
+export interface CostOfActing {
+  available: boolean;
+  reason?: string;
+  dv_ms?: number;
+  direction?: string;
+  direction_label?: string;
+  propellant_kg?: number;
+  burn_utc?: string;
+  lead_h?: number;
+  new_pc?: number;
+  new_miss_km?: number;
+  mass_assumed?: boolean;
+  maneuvering?: string;
+}
+
+export interface SentinelAlert {
+  id: string;
+  primary_norad: number;
+  primary_name: string;
+  tier: Tier;
+  secondary_norad: number;
+  secondary_name: string;
+  secondary_type: OfficialType;
+  tca_utc: string;
+  hours_to_tca: number;
+  miss_km: number;
+  pc: number;
+  ai_p_high: number | null;
+  ai_log10_risk: number | null;
+  decision: DecisionCode;
+  status: SentinelStatusCode;
+  status_reason: string;
+  stale: boolean;
+  early_flag: boolean;
+  lower_confidence: boolean;
+  consec_go: number;
+  updates: number;
+  first_seen: string;
+  last_updated: string;
+  resolved_utc: string | null;
+  dv_ms: number | null;
+  propellant_kg: number | null;
+  burn_utc: string | null;
+  cost_of_acting: CostOfActing;
+  risk_of_not_acting: { pc: number; ai_final_risk: number | null; ai_p_high: number | null; ai_in_domain?: boolean | null };
+}
+
+export interface HistoryPoint {
+  t_utc: string;
+  pc: number;
+  ai_p_high: number | null;
+  ai_log10_risk: number | null;
+  miss_km: number;
+  decision: DecisionCode;
+  status: SentinelStatusCode;
+  data_update: number;
+}
+
+export interface SentinelAlertDetail extends SentinelAlert {
+  record: Conjunction;
+  decision_detail: Decision;
+  explanation: Explanation | null;
+  plan: (Partial<AvoidResponse> & { error?: string }) | null;
+  history: HistoryPoint[];
+}
+
+export interface SentinelRun {
+  started_utc: string;
+  finished_utc: string;
+  trigger: string;
+  catalog_source: string | null;
+  catalog_fetched_utc: string | null;
+  objects_watched: number | null;
+  pairs_checked: number | null;
+  conjunctions: number | null;
+  tracked: number | null;
+  plans: number | null;
+  seconds: number | null;
+  screen_seconds: number | null;
+  error: string | null;
+  decisions?: Record<DecisionCode, number> | null;
+  early_flagged?: number | null;
+  missing?: number[] | null;
+}
+
+export interface SentinelStatus {
+  running: boolean;
+  busy: boolean;
+  phase: string | null;
+  last_run: SentinelRun | null;
+  next_refresh_utc: string | null;
+  refresh_s: number;
+  horizon_h: number;
+  screen_km: number;
+  lower_confidence_after_h: number;
+  alerts_by_status: Partial<Record<SentinelStatusCode, number>>;
+  objects_watched: number;
+  telegram_configured: boolean;
+  note: string;
+}
+
+export interface WatchItem {
+  norad: number;
+  name: string;
+  tier: Tier;
+  source: string;
+  note: string | null;
+  enabled: number;
+  added_utc: string;
+  in_catalog: boolean;
+  object_type: OfficialType | null;
+  perigee_km: number | null;
+  apogee_km: number | null;
+}
+
+export interface WatchlistResponse {
+  tiers: Tier[];
+  items: WatchItem[];
+  sync: Record<string, unknown>;
+}
+
+export interface ReplayPoint {
+  step: number;
+  time_to_tca_d: number;
+  pc: number;
+  ai_p_high: number | null;
+  ai_log10_risk: number | null;
+  miss_km: number;
+  decision: DecisionCode;
+  status: SentinelStatusCode;
+  reason: string;
+  early_flag: boolean;
+}
+
+export interface ReplayState {
+  active: boolean;
+  finished?: boolean;
+  banner?: string;
+  event_id?: number;
+  mission_id?: string;
+  primary_name?: string;
+  secondary_type?: OfficialType;
+  total?: number;
+  step?: number;
+  step_s?: number;
+  cdms?: ReplayPoint[];
+  current?: { record: Conjunction & { time_to_tca_d: number }; decision: Decision; explanation: Explanation; guard: { status: SentinelStatusCode; reason: string; consec_go: number } } | null;
+  final?: { risk_log10: number | null; pc: number | null; time_to_tca_d: number | null; miss_km: number | null; high_risk: boolean; note: string } | null;
+  avoidance?: string;
+  fuel?: string;
+  source?: string;
+}
+
+async function sendJson<T>(method: "POST" | "PATCH" | "DELETE", path: string, body?: unknown): Promise<T> {
+  let res: Response;
+  try {
+    res = await fetch(`${API_URL}${path}`, {
+      method,
+      headers: body === undefined ? undefined : { "Content-Type": "application/json" },
+      body: body === undefined ? undefined : JSON.stringify(body),
+    });
+  } catch {
+    throw new ApiError(0, "Backend unreachable. Is the API running on port 8000?");
+  }
+  if (!res.ok) {
+    let detail = `Request failed (HTTP ${res.status}).`;
+    try {
+      const b = (await res.json()) as { detail?: unknown };
+      if (typeof b.detail === "string") detail = b.detail;
+    } catch {
+      /* keep generic message */
+    }
+    throw new ApiError(res.status, detail);
+  }
+  return (await res.json()) as T;
+}
+
+export const fetchSentinelStatus = () => getJson<SentinelStatus>("/sentinel/status");
+export const fetchSentinelAlerts = () => getJson<SentinelAlert[]>("/sentinel/alerts");
+export const fetchSentinelAlert = (id: string) => getJson<SentinelAlertDetail>(`/sentinel/alerts/${encodeURIComponent(id)}`);
+export const runSentinel = () => sendJson<{ started: boolean }>("POST", "/sentinel/run");
+export const fetchWatchlist = () => getJson<WatchlistResponse>("/sentinel/watchlist");
+export const addToWatchlist = (norad: number, tier: Tier = "Standard") => sendJson<WatchItem>("POST", "/sentinel/watchlist", { norad, tier });
+export const setWatchTier = (norad: number, tier: Tier) => sendJson<WatchItem>("PATCH", `/sentinel/watchlist/${norad}`, { tier });
+export const removeFromWatchlist = (norad: number) => sendJson<{ removed: number }>("DELETE", `/sentinel/watchlist/${norad}`);
+export const startReplay = () => sendJson<ReplayState>("POST", "/sentinel/replay", {});
+export const stopReplay = () => sendJson<ReplayState>("DELETE", "/sentinel/replay");
+export const fetchReplay = () => getJson<ReplayState>("/sentinel/replay");
+export const SENTINEL_STREAM_URL = `${API_URL}/sentinel/stream`;

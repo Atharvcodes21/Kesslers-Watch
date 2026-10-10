@@ -6,27 +6,41 @@ Inputs per conjunction (a /screen record, see risk.conjunction_record + ml.score
 AI calibrated P(high-risk), AI predicted final risk, time to TCA, combined σ and both TLE ages, whether either
 object can manoeuvre (PAYLOAD), and, once /avoid has run, the recommended Δv and decision deadline.
 
-  GO — Manoeuvre        Pc ≥ go_pc or AI final risk ≥ go_ai_final_risk, and the planner found a valid option.
-  Cannot manoeuvre      GO thresholds met but neither object is a payload: monitor.
-  WATCH — Re-assess     Pc or AI final risk in [watch_risk, go), or AI P(high-risk) ≥ the model's operating
-                        threshold, or a TLE older than tle_stale_days, or GO thresholds met without a valid option.
-  NO-GO — Hold          below all thresholds.
+Two-stage logic (`triggers` is the single implementation, used live and for the ESA KPIs in ml.py):
+  Stage 1  AI early flag     AI P(high-risk) ≥ the live model's 95%-recall threshold. A tag only: on its own the
+                             decision stays NO-GO; Sentinel tracks it.
+  Stage 2  Physics           GO — Manoeuvre     Pc ≥ go_pc or AI final risk ≥ go_ai_final_risk, and the planner
+                                                found a valid option.
+                             Cannot manoeuvre   GO thresholds met but neither object is a payload: monitor.
+                             WATCH — Re-assess  Pc ≥ watch_pc; or AI flag and Pc ≥ watch_ai_min_pc; or a TLE older
+                                                than tle_stale_days on an approach closer than stale_watch_miss_km;
+                                                or GO thresholds met without a valid option.
+                             NO-GO — Hold       none of the above.
+  Sentinel guard (sentinel.py): CONFIRMED GO needs GO plus 2 consecutive data updates above the GO threshold, or
+  Pc and AI final risk both at GO level; a stale TLE caps the status at WATCH.
 """
 from __future__ import annotations
 
+import logging
 import math
 from datetime import datetime, timedelta, timezone
 
+import maneuver_opt
 import ml
+import risk
 
 # Every threshold the decision uses. ai_p_high_threshold is filled from the trained live model at runtime
 # (chosen on the validation split for >= 95% recall of high-risk events; see ml.operating_threshold).
 CONFIG: dict = {
     "go_pc": 1e-4,
     "go_ai_final_risk": 1e-4,
-    "watch_risk": 1e-5,
-    "ai_p_high_threshold": None,
+    "watch_pc": 1e-5,  # WATCH on physics alone
+    "watch_ai_min_pc": 1e-6,  # WATCH when the AI early flag is backed by at least this Pc
+    "ai_p_high_threshold": None,  # AI early-flag threshold
     "tle_stale_days": 3.0,
+    "stale_watch_miss_km": 5.0,  # stale data only raises WATCH on approaches closer than this
+    "confirm_updates": 2,  # Sentinel: consecutive data updates above the GO threshold for CONFIRMED GO
+    "confirm_ai_final_risk": 1e-4,  # Sentinel: or Pc ≥ go_pc AND AI final risk ≥ this (both methods agree)
     "avoid_target_pc": 1e-5,  # maneuver_opt.DEFAULT_TARGET_PC: a valid option must bring Pc below this
     "deadline_max_dv_ms": 1.0,  # maneuver_opt.DEADLINE_MAX_DV_MS
     "latest_burn_orbits_before_tca": 0.5,  # latest burn slot the planner evaluates (re-check time before a plan exists)
@@ -34,6 +48,8 @@ CONFIG: dict = {
 
 RANK = {"GO": 0, "MONITOR": 1, "WATCH": 2, "NO-GO": 3}
 LABEL = {"GO": "GO — Manoeuvre", "MONITOR": "Cannot manoeuvre — monitor", "WATCH": "WATCH — Re-assess", "NO-GO": "NO-GO — Hold"}
+EARLY_FLAG_TAG = "AI early flag"
+STALE_TAG = "stale data"
 OPERATOR_NOTE = "Recommendation — operator decides. Never auto-executed."
 
 
@@ -48,11 +64,16 @@ def rules() -> dict:
     thr_txt = f"{thr:.2%}" if thr is not None else "n/a (model not trained)"
     return {
         "config": c,
+        "stages": [
+            {"stage": 1, "title": "AI early flag", "when": f"AI P(high-risk) ≥ {thr_txt} (chosen on validation to catch ≥ 95% of high-risk events). A tag only: on its own the decision stays NO-GO, and Sentinel keeps tracking it."},
+            {"stage": 2, "title": "Physics confirmation", "when": f"WATCH needs Pc ≥ {_sci(c['watch_pc'])}, or the AI flag backed by Pc ≥ {_sci(c['watch_ai_min_pc'])}, or a TLE older than {c['tle_stale_days']:g} d on an approach closer than {c['stale_watch_miss_km']:g} km. GO needs Pc ≥ {_sci(c['go_pc'])} or AI final risk ≥ {_sci(c['go_ai_final_risk'])}, and a valid avoidance option."},
+            {"stage": 3, "title": "Sentinel false-alert guard", "when": f"CONFIRMED GO only if the decision is GO and either the GO threshold held on {c['confirm_updates']} consecutive data updates, or Pc ≥ {_sci(c['go_pc'])} and AI final risk ≥ {_sci(c['confirm_ai_final_risk'])} independently. A TLE older than {c['tle_stale_days']:g} d caps the status at WATCH."},
+        ],
         "rules": [
             {"decision": "GO", "label": LABEL["GO"], "when": f"Pc ≥ {_sci(c['go_pc'])} or AI-predicted final risk ≥ {_sci(c['go_ai_final_risk'])}, and the avoidance planner found a valid option (Pc < {_sci(c['avoid_target_pc'])}, no new conjunction)."},
             {"decision": "MONITOR", "label": LABEL["MONITOR"], "when": "GO thresholds met, but neither object is a payload, so nothing can manoeuvre."},
-            {"decision": "WATCH", "label": LABEL["WATCH"], "when": f"Pc or AI final risk between {_sci(c['watch_risk'])} and {_sci(c['go_pc'])}; or AI P(high-risk) ≥ {thr_txt} (operating threshold); or a TLE older than {c['tle_stale_days']:g} days; or GO thresholds met but no valid option found. Re-check before the decision deadline."},
-            {"decision": "NO-GO", "label": LABEL["NO-GO"], "when": "Below all thresholds."},
+            {"decision": "WATCH", "label": LABEL["WATCH"], "when": f"Pc ≥ {_sci(c['watch_pc'])}; or AI P(high-risk) ≥ {thr_txt} and Pc ≥ {_sci(c['watch_ai_min_pc'])}; or a TLE older than {c['tle_stale_days']:g} d with miss < {c['stale_watch_miss_km']:g} km; or GO thresholds met but no valid option found. Re-check before the decision deadline."},
+            {"decision": "NO-GO", "label": LABEL["NO-GO"], "when": f"Below all thresholds. An AI flag alone stays NO-GO, tagged \u201c{EARLY_FLAG_TAG}\u201d."},
         ],
         "deadline": f"Decision deadline: from the avoidance plan, the latest evaluated burn time with a checked option ≤ {c['deadline_max_dv_ms']:g} m/s. Before a plan exists: the latest burn slot the planner evaluates ({c['latest_burn_orbits_before_tca']:g} orbit before TCA).",
         "ai_note": "AI rules use the live model's estimates; the model was trained on conjunctions 2–7 days out, so closer TCAs are outside its training range (flagged).",
@@ -81,6 +102,33 @@ def _iso(t: datetime) -> str:
     return t.astimezone(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
 
 
+def triggers(pc: float, ai_p: float | None, ai_risk: float | None, oldest_h: float | None, miss_km: float | None,
+             cfg: dict | None = None, ood: str = "") -> dict:
+    """The two-stage rule for one conjunction: GO and WATCH reasons, the AI early flag and staleness.
+
+    The single implementation of the thresholds, used by `evaluate` (live) and by ml.decision_level_kpis (ESA data).
+    """
+    cfg = cfg or config()
+    thr = cfg["ai_p_high_threshold"]
+    ai_flag = ai_p is not None and thr is not None and ai_p >= thr
+    stale = oldest_h is not None and oldest_h > cfg["tle_stale_days"] * 24
+
+    go: list[str] = []
+    if pc >= cfg["go_pc"]:
+        go.append(f"Pc {_sci(pc)} ≥ {_sci(cfg['go_pc'])}")
+    if ai_risk is not None and ai_risk >= cfg["go_ai_final_risk"]:
+        go.append(f"AI-predicted final risk {_sci(ai_risk)} ≥ {_sci(cfg['go_ai_final_risk'])}{ood}")
+
+    watch: list[str] = []
+    if cfg["watch_pc"] <= pc < cfg["go_pc"]:
+        watch.append(f"Pc {_sci(pc)} between {_sci(cfg['watch_pc'])} and {_sci(cfg['go_pc'])}")
+    if ai_flag and cfg["watch_ai_min_pc"] <= pc < cfg["watch_pc"]:
+        watch.append(f"AI early flag ({_pct(ai_p)} chance of ending high-risk ≥ {thr:.2%}){ood}, backed by Pc {_sci(pc)} ≥ {_sci(cfg['watch_ai_min_pc'])}")
+    if stale and miss_km is not None and miss_km < cfg["stale_watch_miss_km"]:
+        watch.append(f"TLE {_age(oldest_h)} old (> {cfg['tle_stale_days']:g} d) on an approach of {miss_km:.2f} km (< {cfg['stale_watch_miss_km']:g} km)")
+    return {"go": go, "watch": watch, "ai_flag": ai_flag, "stale": stale}
+
+
 def evaluate(c: dict, plan: dict | None = None, now: datetime | None = None, period_s: float | None = None) -> dict:
     """Decision for one conjunction. `plan` is the /avoid result for it (None if not run yet).
     `period_s` is the orbital period of the object that would manoeuvre (for the re-check time before a plan exists)."""
@@ -91,25 +139,11 @@ def evaluate(c: dict, plan: dict | None = None, now: datetime | None = None, per
     ai_p = c.get("ai_p_high")
     ai_risk = 10.0 ** c["ai_log10_risk"] if c.get("ai_log10_risk") is not None else None
     ood = "" if c.get("ai_in_domain", True) else " (AI outside its 2–7 d training range)"
-    thr = cfg["ai_p_high_threshold"]
     ages = [a for a in (c.get("primary_tle_age_h"), c.get("secondary_tle_age_h")) if a is not None]
     oldest_h = max(ages) if ages else None
 
-    go: list[str] = []
-    if pc >= cfg["go_pc"]:
-        go.append(f"Pc {_sci(pc)} ≥ {_sci(cfg['go_pc'])}")
-    if ai_risk is not None and ai_risk >= cfg["go_ai_final_risk"]:
-        go.append(f"AI-predicted final risk {_sci(ai_risk)} ≥ {_sci(cfg['go_ai_final_risk'])}{ood}")
-
-    watch: list[str] = []
-    if cfg["watch_risk"] <= pc < cfg["go_pc"]:
-        watch.append(f"Pc {_sci(pc)} between {_sci(cfg['watch_risk'])} and {_sci(cfg['go_pc'])}")
-    if ai_risk is not None and cfg["watch_risk"] <= ai_risk < cfg["go_ai_final_risk"]:
-        watch.append(f"AI-predicted final risk {_sci(ai_risk)} between {_sci(cfg['watch_risk'])} and {_sci(cfg['go_ai_final_risk'])}{ood}")
-    if ai_p is not None and thr is not None and ai_p >= thr:
-        watch.append(f"AI: {_pct(ai_p)} chance of ending high-risk ≥ operating threshold {thr:.2%}{ood}")
-    if oldest_h is not None and oldest_h > cfg["tle_stale_days"] * 24:
-        watch.append(f"TLE {_age(oldest_h)} old (> {cfg['tle_stale_days']:g} d)")
+    t = triggers(pc, ai_p, ai_risk, oldest_h, c.get("miss_km"), cfg, ood)
+    go, watch, ai_flag = t["go"], t["watch"], t["ai_flag"]
 
     movable = can_manoeuvre(c) if plan is None else bool(plan.get("possible"))
     recommended = None
@@ -133,8 +167,13 @@ def evaluate(c: dict, plan: dict | None = None, now: datetime | None = None, per
             headline = "High risk without a valid avoidance option in the grid. Re-assess with fresh orbit data."
     elif watch:
         decision, reasons, headline = "WATCH", watch, "Not actionable yet. Re-assess with fresh orbit data before the deadline."
+    elif ai_flag:
+        decision = "NO-GO"
+        reasons = [f"{EARLY_FLAG_TAG}: AI gives {_pct(ai_p)} chance of ending high-risk (≥ {cfg['ai_p_high_threshold']:.2%}){ood}, "
+                   f"but Pc {_sci(pc)} < {_sci(cfg['watch_ai_min_pc'])}, so physics does not confirm it"]
+        headline = "Below WATCH thresholds. AI early flag: tracked by Sentinel, not actionable on its own."
     else:
-        decision, reasons, headline = "NO-GO", [f"Pc {_sci(pc)} < {_sci(cfg['watch_risk'])}; no other trigger"], "Below all thresholds. Hold."
+        decision, reasons, headline = "NO-GO", [f"Pc {_sci(pc)} < {_sci(cfg['watch_pc'])}; no other trigger"], "Below all thresholds. Hold."
 
     recheck = None
     if decision != "NO-GO":
@@ -159,6 +198,10 @@ def evaluate(c: dict, plan: dict | None = None, now: datetime | None = None, per
         "recommended": recommended,
         "recheck_before": recheck,
         "hours_to_tca": round((tca - now).total_seconds() / 3600.0, 2),
+        "ai_flag": ai_flag,
+        "early_flag": ai_flag and decision == "NO-GO",
+        "stale": t["stale"],
+        "tags": ([EARLY_FLAG_TAG] if ai_flag and decision == "NO-GO" else []) + ([STALE_TAG] if t["stale"] else []),
         "note": OPERATOR_NOTE,
     }
 
@@ -210,3 +253,29 @@ def period_from_tle(tle2: str) -> float | None:
     except ValueError:
         return None
     return 86400.0 / n if n > 0 and math.isfinite(n) else None
+
+
+def assess(index, primary_entry: dict, secondary_entry: dict, tca: datetime, *, mass_kg: float | None = None,
+           isp_s: float | None = None, target_pc: float = maneuver_opt.DEFAULT_TARGET_PC, hbr_m: float = 20.0,
+           now: datetime | None = None) -> dict:
+    """Avoidance plan + fuel + final decision for one conjunction (shared by /avoid and Sentinel).
+
+    Returns the maneuver_opt plan (with Tsiolkovsky fuel) plus `decision`, `explanation` and `conjunction` (the
+    re-refined /screen record with AI scores). Raises ValueError / RuntimeError from the planner.
+    """
+    core = maneuver_opt.plan(index, primary_entry, secondary_entry, tca, target_pc=target_pc, hbr_m=hbr_m)
+    out = maneuver_opt.with_fuel(core, mass_kg, isp_s)
+    # Final Go / No-Go now that the planner says whether a valid option exists. Recommendation only.
+    try:
+        rec = risk.describe_pair(primary_entry, secondary_entry, tca, hbr_m)
+        if rec is not None:
+            now = now or datetime.now(timezone.utc)
+            ml.score_conjunctions([rec], now)
+            mover = (out.get("maneuvering") or {}).get("norad")
+            period = period_from_tle((primary_entry if mover in (None, primary_entry["norad"]) else secondary_entry)["tle2"])
+            out["decision"] = evaluate(rec, out, now, period)
+            out["explanation"] = explain(rec)
+            out["conjunction"] = rec
+    except Exception:  # never let the recommendation break the plan
+        logging.getLogger("kesslerwatch").exception("decision for an avoidance plan failed")
+    return out

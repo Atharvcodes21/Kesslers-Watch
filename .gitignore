@@ -5,3 +5,5 @@ backend/cache/
 backend/data/
 __pycache__/
 design/
+!backend/.env.example
+backend/sentinel.db*

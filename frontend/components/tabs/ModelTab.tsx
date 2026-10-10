@@ -1,11 +1,13 @@
 "use client";
 
 import { ExternalLink } from "lucide-react";
-import { useEffect, useState, type ReactNode } from "react";
+import { Fragment, useEffect, useState, type ReactNode } from "react";
 import {
   ApiError,
   fetchModelMetrics,
   type CalibrationBin,
+  type DecisionLevel,
+  type DecisionLevels,
   type EvalSet,
   type ImportanceRow,
   type Kpis,
@@ -367,29 +369,97 @@ function KpiSection({ m, ds }: { m: ModelMetrics; ds: EvalSet }) {
           <KpiNum value={fmt(r.baseline.pr_auc, 3)} label="Baseline" dim />
         </KpiTile>
         <KpiTile
-          title="Screening throughput (measured)"
+          title="Screening throughput (measured, 72 h)"
           foot={
             tp ? (
               <>
-                One object against {tp.catalog_objects.toLocaleString()} objects over {tp.horizon_h} h on one core; mean over {tp.per_object_seconds.n}{" "}
-                objects {tp.per_object_seconds.mean.toFixed(1)} s. All-vs-all is an estimate: catalog size × mean time, serial. Measured{" "}
-                {tp.measured_utc.slice(0, 10)}.
+                Against {tp.catalog_objects.toLocaleString()} objects over {tp.horizon_h} h on one core. The watchlist shares one SGP4 pass and
+                one KD-tree per 60 s step. All-vs-all is an estimate from a measured slice. Measured {tp.measured_utc.slice(0, 10)}.
               </>
             ) : (
               "Not measured yet: run `python ml.py throughput` in backend/."
             )
           }
         >
-          {tp?.reference && <KpiNum value={`${tp.reference.seconds.toFixed(1)} s`} label={`${tp.reference.name}, 24 h`} />}
+          {tp?.reference && <KpiNum value={`${tp.reference.seconds.toFixed(0)} s`} label={`${tp.reference.name}, ${tp.horizon_h} h`} />}
+          {tp?.watchlist && <KpiNum value={`${tp.watchlist.seconds.toFixed(0)} s`} label={`Watchlist (${tp.watchlist.objects} objects)`} />}
           {tp && <KpiNum value={`${tp.all_vs_all_estimate.hours.toLocaleString()} h`} label="All-vs-all (est.)" dim />}
         </KpiTile>
       </div>
+      {k.decision_levels && <DecisionLevelsTable dl={k.decision_levels} />}
       <LeadTimeTable k={k} ds={ds} />
       <div className="grid gap-6 md:grid-cols-2">
         <ImbalancePanel k={k} />
         <RadialPanel k={k} />
       </div>
     </section>
+  );
+}
+
+const LEVEL_LABEL: Record<DecisionLevel, string> = {
+  early_flag: "Stage 1 · AI early flag",
+  watch_or_above: "Stage 2 · WATCH or above",
+  pc_watch_only: "Pc ≥ 1e−5 alone (no AI)",
+  previous_rule: "Previous rule (AI flag alone raised WATCH)",
+};
+
+/** Two-stage Go / No-Go rule on ESA's events: recall and false-alert rate at both levels. */
+function DecisionLevelsTable({ dl }: { dl: DecisionLevels }) {
+  const sets: EvalSet[] = ["holdout", "official_test"];
+  const levels: DecisionLevel[] = ["early_flag", "watch_or_above", "pc_watch_only", "previous_rule"];
+  return (
+    <Glass className="overflow-x-auto p-7">
+      <h2 className="heading mb-1">Decision levels</h2>
+      <p className="mb-4 max-w-[72ch] text-[14px] text-muted">
+        The AI early flag is tuned to catch ≥ 95% of high-risk events, so it raises many false alerts; on its own it only tags an approach.
+        WATCH needs physics to back it. Truth: ESA&apos;s final risk ≥ 1e−6.
+      </p>
+      <table className="w-full min-w-[620px] text-left text-[15px]">
+        <thead className="text-[14px] text-muted">
+          <tr>
+            <th className="pb-1.5 pr-4 font-medium">Level</th>
+            {sets.map((ds) => (
+              <th key={ds} className="pb-1.5 pr-4 font-medium" colSpan={2}>
+                {SET_LABEL[ds]} ({dl.by_set[ds].n.toLocaleString()} events, {dl.by_set[ds].n_high_risk} high-risk)
+              </th>
+            ))}
+          </tr>
+          <tr>
+            <th />
+            {sets.map((ds) => (
+              <Fragment key={ds}>
+                <th className="pb-1.5 pr-4 font-medium">Recall</th>
+                <th className="pb-1.5 pr-4 font-medium">False alerts</th>
+              </Fragment>
+            ))}
+          </tr>
+        </thead>
+        <tbody>
+          {levels.map((lv) => (
+            <tr key={lv} className={`divider ${lv === "pc_watch_only" || lv === "previous_rule" ? "text-ivory/70" : ""}`}>
+              <td className="py-1.5 pr-4">{LEVEL_LABEL[lv]}</td>
+              {sets.map((ds) => {
+                const c = dl.by_set[ds][lv];
+                return (
+                  <Fragment key={ds}>
+                    <td className="py-1.5 pr-4 font-mono">
+                      {pct(c.recall)} <span className="text-[14px] text-muted">({c.tp}/{c.tp + c.fn})</span>
+                    </td>
+                    <td className="py-1.5 pr-4 font-mono">
+                      {pct(c.false_alert_rate)} <span className="text-[14px] text-muted">({c.fp})</span>
+                    </td>
+                  </Fragment>
+                );
+              })}
+            </tr>
+          ))}
+        </tbody>
+      </table>
+      <p className="mt-3 text-[14px] leading-snug text-muted">
+        False alerts: share of low-risk events alerted. {dl.method} Early-flag-only events (tag, no WATCH): held-out{" "}
+        {dl.by_set.holdout.early_flag_only}, official test {dl.by_set.official_test.early_flag_only}.
+      </p>
+    </Glass>
   );
 }
 

@@ -18,7 +18,7 @@ import {
   type SpaceWeather,
 } from "@/lib/api";
 import { AvoidancePanel } from "./AvoidancePanel";
-import { DecisionBadge, DecisionCard, DecisionRulesSection } from "./DecisionCard";
+import { DecisionBadge, DecisionCard, DecisionRulesSection, EarlyFlagTag } from "./DecisionCard";
 import { EdgePanel } from "./EdgePanel";
 import { DASH, Row, SectionTitle, TypeBadge } from "./Glass";
 
@@ -113,6 +113,7 @@ function AlertCard({
       <div className="flex items-baseline justify-between gap-3">
         <span className="min-w-0 truncate text-[15px] font-semibold">{c.name}</span>
         <span className="flex shrink-0 items-baseline gap-2">
+          {decision?.early_flag && <EarlyFlagTag />}
           {decision && <DecisionBadge d={decision} />}
           <span className="font-mono text-[14px] text-muted">{c.norad}</span>
         </span>
@@ -165,9 +166,12 @@ function SpaceWeatherSection() {
       <Row label="Solar flux F10.7" value={sw ? sw.f107.toFixed(0) : DASH} unit="sfu" />
       <Row label="Kp index" value={sw ? sw.kp.toFixed(2) : DASH} />
       <Row label="Ap (24 h mean)" value={sw?.ap != null ? sw.ap.toFixed(1) : DASH} />
+      <Row label="F10.7, last 27 days (mean)" value={sw?.f107_27d_mean != null ? sw.f107_27d_mean.toFixed(0) : DASH} unit="sfu" />
+      <Row label="F10.7, next 27 days (forecast mean)" value={sw?.outlook?.f107_mean != null ? sw.outlook.f107_mean.toFixed(0) : DASH} unit="sfu" />
       {sw && (
         <p className="mt-1 text-[14px] text-muted">
           NOAA SWPC · Kp at {sw.kp_time_utc.slice(5, 16).replace("T", " ")} UTC{sw.stale ? " · cached (feed unavailable)" : ""}
+          {sw.outlook?.issued ? ` · 27-day outlook issued ${sw.outlook.issued}` : ""}
         </p>
       )}
     </section>
@@ -201,7 +205,14 @@ function ReentrySection({ onFocus, activeNorad }: { onFocus: (r: ReentryItem) =>
             >
               <span className="min-w-0 flex-1 truncate">{r.name}</span>
               <span className="font-mono text-[14px] text-muted">{Math.round(r.perigee_km)} km</span>
-              <span className={`w-[92px] text-right font-mono text-[14px] ${r.risk === "high" ? "text-rose" : r.risk === "medium" ? "text-gold" : ""}`}>
+              <span
+                title={
+                  r.sw_factor != null
+                    ? `Decay-rate heuristic ${r.est_days_raw} d × space-weather factor ${r.sw_factor} (F10.7 ${r.f107_recent} recent vs ${r.f107_forecast_mean} forecast) (est.)`
+                    : undefined
+                }
+                className={`w-[92px] text-right font-mono text-[14px] ${r.risk === "high" ? "text-rose" : r.risk === "medium" ? "text-gold" : ""}`}
+              >
                 {r.overdue ? "imminent (est.)" : `est. ${r.est_days < 1 ? "< 1" : r.est_days.toFixed(0)} d`}
               </span>
             </button>
@@ -209,7 +220,8 @@ function ReentrySection({ onFocus, activeNorad }: { onFocus: (r: ReentryItem) =>
         ))}
       </ul>
       <p className="mt-1.5 text-[14px] leading-snug text-muted">
-        Heuristic from the TLE mean-motion derivative (est.), usually an overestimate. &ldquo;Imminent (est.)&rdquo;: the
+        Heuristic from the TLE mean-motion derivative, scaled by NOAA&apos;s 27-day F10.7 outlook: time × (recent F10.7 ÷ forecast
+        F10.7)^1.5, an assumed density sensitivity (est.). Usually an overestimate. &ldquo;Imminent (est.)&rdquo;: the
         estimated date has already passed since the element set was issued, so re-entry is expected within hours to days
         (or has happened). Click one to focus it.
       </p>

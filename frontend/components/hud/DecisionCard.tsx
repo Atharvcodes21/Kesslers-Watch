@@ -28,6 +28,19 @@ export function DecisionBadge({ d }: { d: Decision }) {
   );
 }
 
+/** Small tag for an AI flag that physics does not confirm (decision stays NO-GO). */
+export function EarlyFlagTag() {
+  return (
+    <span
+      title="AI early flag: the AI model flags this approach, but physics (Pc) does not confirm it. Tracked by Sentinel; not actionable on its own."
+      className="inline-flex shrink-0 items-center whitespace-nowrap rounded-full border px-2 py-px text-[14px]"
+      style={{ borderColor: `${PALETTE.ice}66`, color: PALETTE.ice }}
+    >
+      AI early flag
+    </span>
+  );
+}
+
 function FactorBars({ ex }: { ex: Explanation }) {
   return (
     <ul className="mt-1.5 space-y-1.5">
@@ -71,6 +84,16 @@ export function DecisionCard({ d, ex }: { d: Decision; ex?: Explanation }) {
         </span>
         {d.provisional && <span className="text-[14px] text-muted">pending avoidance plan</span>}
       </div>
+      {(d.early_flag || d.stale) && (
+        <div className="mt-1 flex flex-wrap gap-1.5">
+          {d.early_flag && <EarlyFlagTag />}
+          {d.stale && (
+            <span className="rounded-full border px-2 py-px text-[14px]" style={{ borderColor: `${PALETTE.amber}66`, color: PALETTE.amber }}>
+              stale data
+            </span>
+          )}
+        </div>
+      )}
       <p className="mt-1 text-[15px] leading-snug">{d.headline}</p>
       {d.recheck_before && (
         <p className="mt-1.5 text-[15px]">
@@ -104,6 +127,8 @@ export function DecisionCard({ d, ex }: { d: Decision; ex?: Explanation }) {
 const fmtCfg = (k: string, v: number | null) => {
   if (v === null) return "—";
   if (k.endsWith("_days")) return `${v} d`;
+  if (k.endsWith("_km")) return `${v} km`;
+  if (k === "confirm_updates") return `${v}`;
   if (k.endsWith("_ms")) return `${v} m/s`;
   if (k === "ai_p_high_threshold") return `${(v * 100).toFixed(2)}%`;
   if (k.startsWith("latest_burn")) return `${v} orbit`;
@@ -113,9 +138,13 @@ const fmtCfg = (k: string, v: number | null) => {
 const CFG_LABEL: Record<string, string> = {
   go_pc: "GO: Pc at least",
   go_ai_final_risk: "GO: AI final risk at least",
-  watch_risk: "WATCH: Pc or AI risk at least",
-  ai_p_high_threshold: "WATCH: AI P(high-risk) at least",
-  tle_stale_days: "WATCH: TLE older than",
+  watch_pc: "WATCH: Pc at least",
+  watch_ai_min_pc: "WATCH: AI flag backed by Pc at least",
+  ai_p_high_threshold: "AI early flag: P(high-risk) at least",
+  tle_stale_days: "Stale data: TLE older than",
+  stale_watch_miss_km: "WATCH on stale data: miss under",
+  confirm_updates: "CONFIRMED GO: consecutive updates",
+  confirm_ai_final_risk: "CONFIRMED GO: or AI final risk at least",
   avoid_target_pc: "Valid option: Pc below",
   deadline_max_dv_ms: "Deadline: option Δv at most",
   latest_burn_orbits_before_tca: "Latest burn slot before TCA",
@@ -136,6 +165,18 @@ export function DecisionRulesSection() {
       {err && <p className="mt-1 text-[14px] text-rose">{err}</p>}
       {r && (
         <div className="mt-1.5">
+          {r.stages && (
+            <ol className="mb-3 space-y-1.5">
+              {r.stages.map((st) => (
+                <li key={st.stage} className="rounded-lg bg-white/[0.03] px-2.5 py-2 text-[14px] leading-snug">
+                  <span className="font-semibold text-gold">
+                    Stage {st.stage} · {st.title}
+                  </span>
+                  <span className="mt-0.5 block text-ivory">{st.when}</span>
+                </li>
+              ))}
+            </ol>
+          )}
           <ul className="space-y-1.5">
             {r.rules.map((x) => (
               <li key={x.decision} className="text-[14px] leading-snug">

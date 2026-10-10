@@ -1,15 +1,21 @@
 """KesslerWatch API."""
 from __future__ import annotations
 
+import asyncio
+import json
 import logging
+import os
 import statistics
 import threading
 import time
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
+from typing import Literal
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
+from fastapi.responses import StreamingResponse
 
 from pydantic import BaseModel, Field
 
@@ -18,10 +24,25 @@ import maneuver_opt
 import ml
 import orbit
 import risk
+import sentinel
+import watchlist
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
 
-app = FastAPI(title="KesslerWatch")
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    # Build the catalog in the background so the first page load doesn't wait on a cold download.
+    threading.Thread(target=get_catalog, daemon=True).start()
+    # Sentinel: hourly watchlist screening in a background thread (SENTINEL_DISABLED=1 turns it off).
+    if os.environ.get("SENTINEL_DISABLED") != "1":
+        sentinel.SENTINEL.start(sentinel.Hooks(refresh_catalog=refresh_catalog, get_index=get_index))
+    yield
+    sentinel.SENTINEL.stop()
+    sentinel.REPLAY.stop()
+
+
+app = FastAPI(title="KesslerWatch", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:3000"],
@@ -63,6 +84,18 @@ def get_catalog() -> tuple[list[dict], dict]:
         return _catalog, _meta
 
 
+def refresh_catalog() -> tuple[list[dict], dict, dict[int, dict]]:
+    """Rebuild now (Sentinel, once per cycle). Space-Track is only queried if its cache is over an hour old."""
+    global _catalog, _by_norad, _meta, _built_at
+    with _lock:
+        t0 = time.time()
+        _catalog, _meta = orbit.build_catalog()
+        _by_norad = {e["norad"]: e for e in _catalog}
+        _built_at = time.time()
+        logging.getLogger("kesslerwatch").info("catalog refresh: %d objects from %s in %.1f s", len(_catalog), _meta.get("source"), time.time() - t0)
+        return _catalog, _meta, _by_norad
+
+
 def get_index() -> risk.CatalogIndex:
     """Parsed satrecs for screening, rebuilt only when the catalog is rebuilt."""
     global _index, _index_built_at
@@ -87,12 +120,6 @@ def resolve_object(norad: int) -> dict:
         raise HTTPException(404, f"No element set found for NORAD {norad}.") from None
     except orbit.SourceError as e:
         raise HTTPException(502, f"Lookup failed: {e}") from None
-
-
-@app.on_event("startup")
-def _warm() -> None:
-    # Build in the background so the first page load doesn't wait on a cold download.
-    threading.Thread(target=get_catalog, daemon=True).start()
 
 
 @app.get("/catalog")
@@ -191,29 +218,12 @@ def avoid(req: AvoidRequest) -> dict:
     """Collision-avoidance manoeuvre plan for the payload in this conjunction (see maneuver_opt.py). Estimates."""
     tca = req.tca if req.tca.tzinfo else req.tca.replace(tzinfo=timezone.utc)
     try:
-        core = maneuver_opt.plan(
+        return decision.assess(
             get_index(), resolve_object(req.primary), resolve_object(req.secondary), tca.astimezone(timezone.utc),
-            target_pc=req.target_pc, hbr_m=req.hbr_m,
+            mass_kg=req.mass_kg, isp_s=req.isp_s, target_pc=req.target_pc, hbr_m=req.hbr_m,
         )
     except (ValueError, RuntimeError) as e:
         raise HTTPException(422, str(e)) from None
-    out = maneuver_opt.with_fuel(core, req.mass_kg, req.isp_s)
-    # Final Go / No-Go for this conjunction, now that the planner says whether a valid option exists.
-    # Recommendation only: the operator decides; nothing is executed.
-    try:
-        p_e, s_e = resolve_object(req.primary), resolve_object(req.secondary)
-        rec = risk.describe_pair(p_e, s_e, tca.astimezone(timezone.utc), req.hbr_m)
-        if rec is not None:
-            now = datetime.now(timezone.utc)
-            ml.score_conjunctions([rec], now)
-            mover = (out.get("maneuvering") or {}).get("norad")
-            period = decision.period_from_tle((p_e if mover in (None, p_e["norad"]) else s_e)["tle2"])
-            out["decision"] = decision.evaluate(rec, out, now, period)
-            out["explanation"] = decision.explain(rec)
-            out["conjunction"] = rec
-    except Exception:  # never let the recommendation break the plan
-        logging.getLogger("kesslerwatch").exception("decision for /avoid failed")
-    return out
 
 
 @app.get("/decision/rules")
@@ -224,16 +234,38 @@ def decision_rules() -> dict:
 
 @app.get("/reentry")
 def reentry(limit: int = Query(25, ge=1, le=200)) -> list[dict]:
-    """Objects likely to re-enter soon. HEURISTIC from the mean-motion derivative; every value is est."""
-    return risk.reentry(get_catalog()[0], limit=limit)
+    """Objects likely to re-enter soon. HEURISTIC from the mean-motion derivative, scaled by the NOAA SWPC 27-day
+    F10.7 outlook when available; every value is est."""
+    return risk.reentry(get_catalog()[0], limit=limit, solar=_solar())
+
+
+def _solar() -> dict | None:
+    """Observed 27-day mean F10.7 + the 27-day outlook, for the re-entry scaling (None if either is unavailable)."""
+    try:
+        sw = orbit.space_weather()
+        ol = orbit.solar_outlook()
+    except orbit.SourceError:
+        return None
+    recent = sw.get("f107_27d_mean") or sw.get("f107")
+    return {"f107_recent": recent, "days": ol["days"]} if recent and ol.get("days") else None
 
 
 @app.get("/spaceweather")
 def spaceweather() -> dict:
     try:
-        return orbit.space_weather()
+        sw = orbit.space_weather()
     except orbit.SourceError as e:
         raise HTTPException(502, str(e)) from None
+    try:
+        ol = orbit.solar_outlook()
+        today = datetime.now(timezone.utc).date().isoformat()
+        ahead = [d for d in ol["days"] if d["date"] >= today]
+        sw = {**sw, "outlook": {"issued": ol.get("issued"), "source": ol.get("source"), "stale": ol.get("stale"),
+                                "f107_mean": round(sum(d["f107"] for d in ahead) / len(ahead), 1) if ahead else None,
+                                "days": ahead}}
+    except orbit.SourceError:
+        sw = {**sw, "outlook": None}
+    return sw
 
 
 @app.get("/model/metrics")
@@ -291,6 +323,142 @@ def passes(
     """Upcoming optically visible passes over an observer (N2YO 'visual passes')."""
     data = _n2yo_call(orbit.n2yo_passes, norad, lat, lon, alt_m, days, min_visibility)
     return {"observer": {"lat": lat, "lon": lon, "alt_m": alt_m}, **data}
+
+
+# --------------------------------------------------------------------------- Sentinel
+
+
+@app.get("/sentinel/status")
+def sentinel_status() -> dict:
+    return sentinel.SENTINEL.status()
+
+
+@app.get("/sentinel/alerts")
+def sentinel_alerts(include_resolved: bool = True) -> list[dict]:
+    """Alert board, sorted by status (CONFIRMED GO, WATCH, NEW, RESOLVED) then Pc."""
+    return sentinel.SENTINEL.alerts(include_resolved)
+
+
+@app.get("/sentinel/alerts/{alert_id}")
+def sentinel_alert(alert_id: str) -> dict:
+    a = sentinel.SENTINEL.alert(alert_id)
+    if a is None:
+        raise HTTPException(404, "No such alert.")
+    return a
+
+
+@app.post("/sentinel/run", status_code=202)
+def sentinel_run() -> dict:
+    """Start a cycle now (the catalog still comes from cache unless it is over an hour old)."""
+    if not sentinel.SENTINEL.trigger():
+        raise HTTPException(409, "Sentinel is already running a cycle.")
+    return {"started": True}
+
+
+@app.get("/sentinel/watchlist")
+def sentinel_watchlist() -> dict:
+    get_catalog()
+    items = []
+    for it in watchlist.items():
+        e = _by_norad.get(it["norad"])
+        items.append({**it, "in_catalog": e is not None, "object_type": e["object_type"] if e else None,
+                      "perigee_km": e["perigee_km"] if e else None, "apogee_km": e["apogee_km"] if e else None})
+    return {"tiers": list(watchlist.TIERS), "items": items, "sync": watchlist.sync_info()}
+
+
+class WatchAdd(BaseModel):
+    norad: int = Field(gt=0, lt=1_000_000)
+    tier: Literal["Crewed", "Critical", "Standard"] = "Standard"
+
+
+@app.post("/sentinel/watchlist")
+def sentinel_watch_add(req: WatchAdd) -> dict:
+    e = resolve_object(req.norad)
+    return watchlist.add(e["norad"], e["name"], req.tier)
+
+
+class WatchTier(BaseModel):
+    tier: Literal["Crewed", "Critical", "Standard"]
+
+
+@app.patch("/sentinel/watchlist/{norad}")
+def sentinel_watch_tier(norad: int, req: WatchTier) -> dict:
+    r = watchlist.set_tier(norad, req.tier)
+    if r is None:
+        raise HTTPException(404, "Not on the watchlist.")
+    return r
+
+
+@app.delete("/sentinel/watchlist/{norad}")
+def sentinel_watch_remove(norad: int) -> dict:
+    if not watchlist.remove(norad):
+        raise HTTPException(404, "Not on the watchlist.")
+    return {"removed": norad}
+
+
+SSE_STREAM_MAX_S = 25.0  # each stream ends after this; EventSource reconnects with Last-Event-ID (nothing is lost)
+
+
+@app.get("/sentinel/stream")
+async def sentinel_stream(request: Request) -> StreamingResponse:
+    """Server-sent events: `run` (cycle started / finished), `alert` (new WATCH or CONFIRMED GO), `alert_summary`,
+    `replay`. Streams are short-lived on purpose: an endless stream keeps uvicorn's graceful shutdown (and --reload)
+    waiting forever. Events missed between streams are re-sent from a buffer using the Last-Event-ID header."""
+    notifier = sentinel.SENTINEL.notifier
+    q = notifier.subscribe()
+    try:
+        last_id = int(request.headers.get("last-event-id") or 0)
+    except ValueError:
+        last_id = 0
+
+    def frame(msg: dict) -> str:
+        return f"id: {msg['_id']}\nevent: {msg['type']}\ndata: {json.dumps(msg, default=str)}\n\n"
+
+    async def gen():
+        try:
+            yield "retry: 3000\n\n"
+            yield f"event: hello\ndata: {json.dumps({'status': sentinel.SENTINEL.status()})}\n\n"
+            sent = last_id
+            for i, msg in notifier.since(last_id) if last_id else []:
+                sent = i
+                yield frame(msg)
+            deadline = time.monotonic() + SSE_STREAM_MAX_S
+            while time.monotonic() < deadline and not await request.is_disconnected():
+                try:
+                    msg = await asyncio.wait_for(q.get(), timeout=min(10.0, max(0.1, deadline - time.monotonic())))
+                except asyncio.TimeoutError:
+                    yield ": keep-alive\n\n"
+                    continue
+                if msg["_id"] > sent:
+                    sent = msg["_id"]
+                    yield frame(msg)
+        finally:
+            notifier.unsubscribe(q)
+
+    return StreamingResponse(gen(), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+
+class ReplayStart(BaseModel):
+    event_id: int | None = None
+
+
+@app.post("/sentinel/replay")
+def sentinel_replay_start(req: ReplayStart | None = None) -> dict:
+    """Replay a real high-risk ESA Kelvins test event through the AI, decision and guard (historical, not live)."""
+    try:
+        return sentinel.REPLAY.start(req.event_id if req else None)
+    except (FileNotFoundError, ValueError) as e:
+        raise HTTPException(404, str(e)) from None
+
+
+@app.get("/sentinel/replay")
+def sentinel_replay_state() -> dict:
+    return sentinel.REPLAY.state or {"active": False}
+
+
+@app.delete("/sentinel/replay")
+def sentinel_replay_stop() -> dict:
+    return sentinel.REPLAY.stop() or {"active": False}
 
 
 @app.get("/health")

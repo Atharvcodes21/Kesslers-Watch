@@ -1,10 +1,11 @@
 "use client";
 
 import dynamic from "next/dynamic";
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   ApiError,
   OBJECT_TYPES,
+  addToWatchlist,
   fetchCatalog,
   fetchMetrics,
   fetchObject,
@@ -17,7 +18,11 @@ import {
   type Conjunction,
   type ObjectType,
   type ReentryItem,
+  type ReplayState,
+  type SentinelAlertDetail,
+  type SentinelStatus,
 } from "@/lib/api";
+import { alertSummary, chime, notify, useSentinelStream } from "@/lib/sentinel";
 import { medianTleAgeHours, positionAt, temeToScene, toSatrec, type Vec3 } from "@/lib/orbit";
 import { useObserver } from "@/lib/observer";
 import { PALETTE } from "@/lib/theme";
@@ -36,6 +41,7 @@ import type { LayerVisibility } from "./scene/ObjectField";
 import type { SceneFocus } from "./scene/Scene";
 import { AboutTab } from "./tabs/AboutTab";
 import { ModelTab } from "./tabs/ModelTab";
+import { SentinelTab } from "./tabs/SentinelTab";
 
 const Scene = dynamic(() => import("./scene/Scene"), { ssr: false });
 
@@ -46,6 +52,8 @@ const EDGE = 24;
 const NAV_H = 84;
 const DOCK_H = 80;
 const RIGHT_TOP = 112; // below the catalog count / freshness block
+const SENTINEL_TOP = 206; // below the Sentinel header strip
+const SENTINEL_TOP_REPLAY = 250; // header grows by one row (the replay banner)
 const LOGO_FULL = 272;
 const LOGO_COMPACT = 160;
 const LOGO_MOBILE = 120;
@@ -138,18 +146,46 @@ export function Dashboard() {
   const onAvoidPlan = useCallback((p: AvoidResponse | null) => setAvoidPlan(p), []);
   const [toast, setToast] = useState<ToastMsg | null>(null);
 
+  // Sentinel: status + replay pushed over SSE; `sentinelVersion` bumps whenever the board should reload.
+  const [sentinelStatus, setSentinelStatus] = useState<SentinelStatus | null>(null);
+  const [replay, setReplay] = useState<ReplayState | null>(null);
+  const [sentinelVersion, setSentinelVersion] = useState(0);
+  useSentinelStream({
+    onHello: setSentinelStatus,
+    onRun: (phase, st) => {
+      if (st) setSentinelStatus(st);
+      else setSentinelStatus((s) => (s ? { ...s, busy: phase === "started" } : s));
+      if (phase === "finished") setSentinelVersion((v) => v + 1);
+    },
+    onReplay: setReplay,
+    onAlert: (e) => {
+      const { title, body } = alertSummary(e);
+      setToast({ id: Date.now(), text: `${title} ${body}` });
+      chime();
+      notify(title, body);
+      if (!e.replay) setSentinelVersion((v) => v + 1);
+    },
+    onSummary: (e) => {
+      setToast({ id: Date.now(), text: `Sentinel: ${e.text}` });
+      notify("KesslerWatch Sentinel", e.text);
+    },
+  });
+
   const select = useCallback((norad: number) => {
     setFocus(null); // picking anything else leaves focus mode
     setSelection({ norad, at: simNow() });
-    setTab("live");
+    setTab((t) => (t === "sentinel" ? t : "live"));
     setLeftOpen(true); // details live in the catalog panel
   }, []);
 
+  const focusRef = useRef<Focus | null>(null);
+  useEffect(() => {
+    focusRef.current = focus;
+  }, [focus]);
   const clearFocus = useCallback(() => {
-    setFocus((f) => {
-      if (f?.kind === "conjunction") simClock.now(); // we moved the clock to TCA; return to live time
-      return null;
-    });
+    // We moved the clock to TCA for a conjunction; return to live time (outside any state updater).
+    if (focusRef.current?.kind === "conjunction") simClock.now();
+    setFocus(null);
     setSelection(null);
   }, []);
 
@@ -232,6 +268,30 @@ export function Dashboard() {
     [ensureLoaded],
   );
 
+  /** Sentinel alert: same conjunction focus, plus the stored avoidance path. */
+  const focusSentinelAlert = useCallback(
+    async (d: SentinelAlertDetail | null) => {
+      if (!d) return;
+      const plan = d.plan?.path
+        ? ({ ...d.plan, primary: { norad: d.primary_norad }, secondary: { norad: d.secondary_norad } } as AvoidResponse)
+        : null;
+      setAvoidPlan(plan);
+      setShowAvoidPath(true);
+      await focusConjunction({ ...d.record, primary_norad: d.primary_norad, norad: d.secondary_norad, tca_utc: d.record.tca_utc ?? d.tca_utc });
+    },
+    [focusConjunction],
+  );
+
+  const addToSentinel = useCallback(async (norad: number) => {
+    try {
+      const it = await addToWatchlist(norad);
+      setToast({ id: Date.now(), text: `${it.name} added to Sentinel (${it.tier}). Screened from the next refresh.` });
+      setSentinelVersion((v) => v + 1);
+    } catch (e) {
+      setToast({ id: Date.now(), text: e instanceof ApiError ? e.message : "Could not add to Sentinel." });
+    }
+  }, []);
+
   /** Re-entry focus: fade the rest, object in amber with its orbit; camera follows it. */
   const focusReentry = useCallback(
     async (item: ReentryItem) => {
@@ -306,6 +366,8 @@ export function Dashboard() {
   const dismissToast = useCallback(() => setToast(null), []);
 
   const live = tab === "live";
+  const sentinelTab = tab === "sentinel";
+  const globeTab = live || sentinelTab;
   const logoWidth = narrow ? LOGO_MOBILE : live ? LOGO_FULL : LOGO_COMPACT;
   const belowLogo = Math.round(LOGO_Y + logoHeight(logoWidth) + 18);
   const rightTop = narrow ? belowLogo : RIGHT_TOP;
@@ -315,8 +377,8 @@ export function Dashboard() {
   // The globe is the focus: only the nav, the time dock and the screen edges are reserved.
   // Edge panels float over the scene when opened, so the globe keeps its full size.
   const insets: Insets = useMemo(
-    () => ({ left: EDGE, right: EDGE, top: NAV_H, bottom: live ? DOCK_H : EDGE }),
-    [live],
+    () => ({ left: EDGE, right: EDGE, top: NAV_H, bottom: globeTab ? DOCK_H : EDGE }),
+    [globeTab],
   );
 
   const toggleRight = (id: Exclude<RightPanelId, null>) => setRightOpen((cur) => (cur === id ? null : id));
@@ -340,7 +402,7 @@ export function Dashboard() {
       <div
         aria-hidden
         className={`pointer-events-none fixed inset-0 bg-space/75 transition-opacity duration-1000 ease-soft motion-reduce:transition-none ${
-          live ? "opacity-0" : "opacity-100"
+          globeTab ? "opacity-0" : "opacity-100"
         }`}
       />
 
@@ -374,6 +436,7 @@ export function Dashboard() {
             onLookup={lookup}
             onAddPasted={addExtra}
             onClear={clearSelection}
+            onAddToSentinel={(n) => void addToSentinel(n)}
             open={leftOpen}
             onToggle={() => setLeftOpen((o) => !o)}
             top={belowLogo}
@@ -416,11 +479,29 @@ export function Dashboard() {
               onClear={clearFocus}
             />
           )}
-          <Toast toast={toast} onDone={dismissToast} />
         </div>
       )}
 
-      {!live && (
+      {sentinelTab && (
+        <div key="sentinel" className="fade-in">
+          <SentinelTab
+            catalog={objects}
+            status={sentinelStatus}
+            replay={replay}
+            version={sentinelVersion}
+            onReplay={setReplay}
+            onFocusAlert={(d) => void focusSentinelAlert(d)}
+            onClearFocus={clearFocus}
+            onNotify={(text) => setToast({ id: Date.now(), text })}
+            top={Math.max(replay?.active || replay?.finished ? SENTINEL_TOP_REPLAY : SENTINEL_TOP, belowLogo)}
+          />
+          <TimeDock style={{ left: insets.left, right: insets.right }} overview={overview} onOverview={setOverview} />
+        </div>
+      )}
+
+      <Toast toast={toast} onDone={dismissToast} />
+
+      {!globeTab && (
         <div
           key={tab}
           className="fade-in fixed inset-x-0 bottom-0 z-10 overflow-y-auto overscroll-contain"

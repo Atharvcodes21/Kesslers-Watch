@@ -1,8 +1,14 @@
 """Conjunction screening, collision probability, avoidance-maneuver sizing and re-entry heuristic.
 
 Follows CLAUDE.md "Physics rules": km, km/s, s, UTC; coarse vectorized SGP4 pass (SatrecArray,
-60 s step, chunks of 2000) refined at 1 s; isotropic sigma from TLE age (an ASSUMPTION, TLEs carry
+60 s step) refined at 1 s; isotropic sigma from TLE age (an ASSUMPTION, TLEs carry
 no covariance); Pc = ncx2.cdf((R/sigma)^2, df=2, nc=(d/sigma)^2); along-track drift Δs ≈ 3·Δv·Δt.
+
+Coarse pass (`screen_many`): the catalog is propagated ONCE per block of time steps and, at every 60 s step,
+a scipy cKDTree of all catalog positions answers query_ball_point for every protected asset at once. The ball
+radius is the step's capture radius (screen_km + VREL_MAX_KMS · step / 2): at 60 s two objects can close
+~15 km/s × 30 s between samples, so a literal 10 km ball would miss most crossings. Each hit gets a straight-line
+closest approach (±half a step); only those within screen_km + LINEAR_MARGIN_KM go to the 1 s refinement.
 """
 from __future__ import annotations
 
@@ -12,6 +18,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
 import numpy as np
+from scipy.spatial import cKDTree
 from scipy.stats import ncx2
 from sgp4.api import Satrec, SatrecArray, jday
 
@@ -20,7 +27,9 @@ CHUNK = 2000
 REFINE_HALF_S = 60  # refine at 1 s over ±60 s around each coarse minimum
 ALT_MARGIN_KM = 100.0  # perigee/apogee prefilter margin (mean elements vs osculating radius)
 VREL_MAX_KMS = 16.0  # upper bound on LEO relative speed, sets the coarse capture distance
-LINEAR_MARGIN_KM = 50.0  # screen_paths: straight-line pre-check margin before the 1 s refinement
+LINEAR_MARGIN_KM = 50.0  # straight-line pre-check margin (curvature) before the 1 s refinement
+KD_BLOCK_STEPS = 30  # time steps propagated together in screen_many (memory ≈ catalog × 30 × 6 floats)
+FAR_KM = 1e9  # position used for objects SGP4 cannot propagate at a step (never inside any ball)
 PC_ALERT = 1e-4  # "alert" (high risk)
 PC_WATCH = 1e-6  # "watch"
 PC_MANEUVER_TARGET = 1e-6  # maneuvers aim to bring Pc below this
@@ -28,6 +37,11 @@ MANEUVER_LEADS_H = (0.5, 1, 2, 6, 12, 24)
 REENTRY_N_REVDAY = 16.4  # ~165 km circular altitude; below this, re-entry follows within hours
 REENTRY_MAX_PERIGEE_KM = 400.0
 REENTRY_MAX_DAYS = 365.0
+# ASSUMED: thermospheric density (hence decay rate) scales as F10.7^alpha. Densities near 400 km change by roughly
+# an order of magnitude between solar minimum (F10.7 ~70) and maximum (~200), i.e. alpha ~2; lower down the
+# change is smaller. 1.5 is a middle value for 200-400 km perigees. Labelled "est." everywhere it is used.
+SW_DENSITY_EXPONENT = 1.5
+SW_FACTOR_RANGE = (0.33, 3.0)  # clamp on the space-weather scaling of the decay time
 
 
 # --------------------------------------------------------------------------- catalog index
@@ -179,6 +193,164 @@ def describe_pair(primary_entry: dict, secondary_entry: dict, tca_utc: datetime,
 # --------------------------------------------------------------------------- screening
 
 
+def screen_many(
+    index: CatalogIndex,
+    primaries: list[dict],
+    horizon_h: float = 24.0,
+    screen_km: float = 10.0,
+    hbr_m: float = 20.0,
+    t0: datetime | None = None,
+) -> tuple[list[list[dict]], list[dict], dict]:
+    """Screen several assets against the whole catalog with one shared propagation and one cKDTree per step.
+
+    Returns (conjunctions per asset, stats per asset, run stats). Same refinement, σ and Pc as before; per asset a
+    perigee/apogee prefilter (±screen_km + 100 km) and the co-located exclusion (objects within screen_km for the
+    whole window: docked modules, formation flyers) still apply.
+    """
+    t_start = time.perf_counter()
+    t0 = (t0 or datetime.now(timezone.utc)).replace(microsecond=0)
+    horizon_s = horizon_h * 3600.0
+    hbr_km = hbr_m / 1000.0
+    times = np.arange(0.0, horizon_s + 1e-9, COARSE_STEP_S)
+    nt = len(times)
+    jd, fr = _jd(t0, times)
+
+    W = len(primaries)
+    psat = [Satrec.twoline2rv(e["tle1"], e["tle2"]) for e in primaries]
+    pnorad = np.array([e["norad"] for e in primaries], dtype=np.int64)
+    ep, rp, vp = SatrecArray(psat).sgp4(jd, fr)  # (W, nt), (W, nt, 3)
+    p_ok = ep == 0
+    usable = p_ok.any(axis=1)
+
+    # Per-asset altitude band; the catalog subset is the union of all bands.
+    lo = np.array([e["perigee_km"] for e in primaries]) - screen_km - ALT_MARGIN_KM
+    hi = np.array([e["apogee_km"] for e in primaries]) + screen_km + ALT_MARGIN_KM
+    band = (index.apogee[None, :] >= lo[:, None]) & (index.perigee[None, :] <= hi[:, None])  # (W, N)
+    band &= usable[:, None]
+    band &= index.norad[None, :] != pnorad[:, None]
+    cand = np.nonzero(band.any(axis=0))[0]
+    band_c = band[:, cand]  # (W, M)
+    M = len(cand)
+    arr = SatrecArray([index.satrecs[i] for i in cand]) if M else None
+
+    capture_km = screen_km + VREL_MAX_KMS * COARSE_STEP_S / 2
+    keep_km = screen_km + LINEAR_MARGIN_KM
+    tau_max = 0.6 * COARSE_STEP_S  # straight-line search a little beyond half a step
+    close_counts = np.zeros(W * max(M, 1), dtype=np.int32)  # steps with d < screen_km, per (asset, object)
+    valid_c = np.zeros(M, dtype=np.int32)  # steps each object propagated
+    hits = 0
+    found: list[np.ndarray] = []  # rows: w, m, t_est, d_lin
+    t_prop = t_tree = 0.0
+    for b0 in range(0, nt if M else 0, KD_BLOCK_STEPS):
+        b1 = min(b0 + KD_BLOCK_STEPS, nt)
+        tp = time.perf_counter()
+        e, r, v = arr.sgp4(jd[b0:b1], fr[b0:b1])  # (M, B, 3)
+        t_prop += time.perf_counter() - tp
+        tq = time.perf_counter()
+        ok = e == 0
+        valid_c += ok.sum(axis=1).astype(np.int32)
+        for k in range(b1 - b0):
+            step = b0 + k
+            ws = np.nonzero(p_ok[:, step])[0]
+            if not len(ws):
+                continue
+            pos = np.where(ok[:, k, None], r[:, k], FAR_KM)
+            tree = cKDTree(pos, balanced_tree=False, compact_nodes=False)
+            nb = tree.query_ball_point(rp[ws, step], capture_km, return_sorted=False)
+            lens = np.fromiter((len(x) for x in nb), dtype=np.int64, count=len(ws))
+            if not lens.sum():
+                continue
+            wi = np.repeat(ws, lens)
+            mi = np.concatenate([np.asarray(x, dtype=np.int64) for x in nb if len(x)])
+            sel = band_c[wi, mi]
+            wi, mi = wi[sel], mi[sel]
+            hits += len(wi)
+            if not len(wi):
+                continue
+            rel = r[mi, k] - rp[wi, step]
+            vrel = v[mi, k] - vp[wi, step]
+            d = np.linalg.norm(rel, axis=1)
+            close = d < screen_km
+            if close.any():
+                np.add.at(close_counts, wi[close] * M + mi[close], 1)
+            tau = np.clip(-np.einsum("ij,ij->i", rel, vrel) / np.maximum(np.einsum("ij,ij->i", vrel, vrel), 1e-12), -tau_max, tau_max)
+            dlin = np.linalg.norm(rel + vrel * tau[:, None], axis=1)
+            near = dlin < keep_km
+            if near.any():
+                found.append(np.column_stack([wi[near], mi[near], times[step] + tau[near], dlin[near]]))
+        t_tree += time.perf_counter() - tq
+    t_coarse = time.perf_counter() - t_start
+
+    # Co-located: within screen_km at every step both objects propagated.
+    both_valid = np.minimum(p_ok.sum(axis=1)[:, None], valid_c[None, :]) if M else np.zeros((W, 0))
+    cc = close_counts[: W * M].reshape(W, M) if M else np.zeros((W, 0))
+    colocated = (cc > 0) & (cc >= both_valid)
+
+    # One refinement per (asset, object, ~5-minute window), centred on the best straight-line estimate.
+    t_ref = time.perf_counter()
+    events: list[dict[tuple[int, int], dict]] = [{} for _ in range(W)]
+    refined = 0
+    if found:
+        F = np.vstack(found)
+        F = F[~colocated[F[:, 0].astype(int), F[:, 1].astype(int)]]
+        order = np.lexsort((F[:, 3], np.round(F[:, 2] / 300.0), F[:, 1], F[:, 0]))
+        F = F[order]
+        keys = np.column_stack([F[:, 0], F[:, 1], np.round(F[:, 2] / 300.0)])
+        first = np.ones(len(F), bool)
+        first[1:] = np.any(keys[1:] != keys[:-1], axis=1)
+        for w, m, t_est, _ in F[first]:
+            w, m = int(w), int(m)
+            i = int(cand[m])
+            ref = _refine(psat[w], index.satrecs[i], t0, float(t_est), 0.0, horizon_s)
+            refined += 1
+            if ref is None or ref[1] > screen_km:
+                continue
+            key = (i, int(round(ref[0] / 300)))
+            if key in events[w] and events[w][key]["miss_km"] <= ref[1]:
+                continue
+            events[w][key] = conjunction_record(primaries[w], psat[w], index.entries[i], index.satrecs[i], t0, ref, hbr_km)
+    t_ref = time.perf_counter() - t_ref
+
+    elapsed = time.perf_counter() - t_start
+    results, per = [], []
+    for w, pe in enumerate(primaries):
+        res = sorted(events[w].values(), key=lambda c: (-c["pc"], c["miss_km"]))
+        results.append(res)
+        co = [int(index.norad[cand[m]]) for m in np.nonzero(colocated[w])[0]] if M else []
+        pairs = len(index.entries) - (1 if pe["norad"] in index.pos else 0)
+        per.append({
+            "primary_norad": pe["norad"],
+            "window_start_utc": _iso(t0),
+            "horizon_h": horizon_h,
+            "screen_km": screen_km,
+            "hbr_m": hbr_m,
+            "objects_in_catalog": pairs,
+            "pairs_after_altitude_filter": int(band_c[w].sum()) if M else 0,
+            "co_located_excluded": len(co),
+            "co_located_norads": co[:50],
+            "conjunctions": len(res),
+            "alerts": sum(1 for c in res if c["alert"]),
+            "propagated": bool(usable[w]),
+        })
+    run = {
+        "method": "shared SGP4 propagation + scipy cKDTree per 60 s step (query_ball_point), 1 s refinement",
+        "window_start_utc": _iso(t0),
+        "horizon_h": horizon_h,
+        "screen_km": screen_km,
+        "capture_radius_km": capture_km,
+        "assets": W,
+        "objects_propagated": int(M),
+        "time_steps": int(nt),
+        "kdtree_hits": int(hits),
+        "refined_candidates": int(refined),
+        "pairs_checked": int(band_c.sum()) if M else 0,
+        "seconds": round(elapsed, 2),
+        "seconds_split": {"propagation": round(t_prop, 2), "kdtree": round(t_tree, 2), "refine": round(t_ref, 2)},
+        "coarse_seconds": round(t_coarse, 2),
+    }
+    return results, per, run
+
+
 def screen(
     index: CatalogIndex,
     primary_entry: dict,
@@ -187,90 +359,29 @@ def screen(
     hbr_m: float = 20.0,
     t0: datetime | None = None,
 ) -> tuple[list[dict], dict]:
-    """Screen one asset against the whole catalog. Returns (conjunctions, stats)."""
-    t_start = time.perf_counter()
-    t0 = (t0 or datetime.now(timezone.utc)).replace(microsecond=0)
-    horizon_s = horizon_h * 3600.0
-    hbr_km = hbr_m / 1000.0
-    pnorad = primary_entry["norad"]
-    primary = Satrec.twoline2rv(primary_entry["tle1"], primary_entry["tle2"])
-
-    times = np.arange(0.0, horizon_s + 1e-9, COARSE_STEP_S)
-    jd, fr = _jd(t0, times)
-    ep, rp, _ = primary.sgp4_array(jd, fr)
-    if np.all(ep != 0):
+    """Screen one asset against the whole catalog (screen_many with one asset). Returns (conjunctions, stats)."""
+    probe = Satrec.twoline2rv(primary_entry["tle1"], primary_entry["tle2"])
+    t = (t0 or datetime.now(timezone.utc)).replace(microsecond=0)
+    jd, fr = _jd(t, np.arange(0.0, horizon_h * 3600.0 + 1e-9, COARSE_STEP_S))
+    if np.all(probe.sgp4_array(jd, fr)[0] != 0):
         raise ValueError("SGP4 cannot propagate the protected asset over this window.")
-
-    # Altitude-band prefilter: skip objects whose perigee/apogee shell cannot reach the asset's.
-    p_lo = primary_entry["perigee_km"] - screen_km - ALT_MARGIN_KM
-    p_hi = primary_entry["apogee_km"] + screen_km + ALT_MARGIN_KM
-    mask = (index.apogee >= p_lo) & (index.perigee <= p_hi) & (index.norad != pnorad)
-    candidates = np.nonzero(mask)[0]
-
-    # Any pass closer than this at a 60 s sample could dip below screen_km in between.
-    capture_km = screen_km + VREL_MAX_KMS * COARSE_STEP_S / 2
-    minima: list[tuple[int, float]] = []
-    pair_epochs = 0
-    co_located: list[int] = []
-    for start in range(0, len(candidates), CHUNK):
-        idx = candidates[start : start + CHUNK]
-        arr = SatrecArray([index.satrecs[i] for i in idx])
-        e, r, _ = arr.sgp4(jd, fr)  # (n, nt), (n, nt, 3)
-        d = np.linalg.norm(r - rp[None, :, :], axis=2)
-        d[(e != 0) | (ep[None, :] != 0)] = np.inf
-        pair_epochs += d.size
-        # Objects that never leave the screening radius are attached to / flying with the asset
-        # (e.g. ISS modules catalogued separately with the same elements): not conjunctions.
-        dmax = np.where(np.isfinite(d), d, -np.inf).max(axis=1)
-        attached = np.isfinite(dmax) & (dmax >= 0) & (dmax < screen_km)
-        co_located += [int(index.norad[i]) for i in idx[attached]]
-        d[attached] = np.inf
-        interior = (d[:, 1:-1] <= d[:, :-2]) & (d[:, 1:-1] <= d[:, 2:]) & (d[:, 1:-1] < capture_km)
-        rows, cols = np.nonzero(interior)
-        minima += [(int(idx[a]), float(times[b + 1])) for a, b in zip(rows, cols)]
-        for edge, nb in ((0, 1), (-1, -2)):
-            hit = np.nonzero((d[:, edge] < capture_km) & (d[:, edge] <= d[:, nb]))[0]
-            minima += [(int(idx[a]), float(times[edge])) for a in hit]
-    t_coarse = time.perf_counter() - t_start
-
-    events: dict[tuple[int, int], dict] = {}
-    for i, center in minima:
-        ref = _refine(primary, index.satrecs[i], t0, center, 0.0, horizon_s)
-        if ref is None:
-            continue
-        tca_s, miss = ref[0], ref[1]
-        if miss > screen_km:
-            continue
-        key = (i, int(round(tca_s / 300)))  # one event per object per 5-minute window
-        if key in events and events[key]["miss_km"] <= miss:
-            continue
-        events[key] = conjunction_record(primary_entry, primary, index.entries[i], index.satrecs[i], t0, ref, hbr_km)
-
-    results = sorted(events.values(), key=lambda c: (-c["pc"], c["miss_km"]))
-    elapsed = time.perf_counter() - t_start
-    pairs = len(index.entries) - (1 if pnorad in index.pos else 0)
+    results, per, run = screen_many(index, [primary_entry], horizon_h, screen_km, hbr_m, t)
     stats = {
-        "primary_norad": pnorad,
-        "window_start_utc": _iso(t0),
-        "horizon_h": horizon_h,
-        "screen_km": screen_km,
-        "hbr_m": hbr_m,
-        "objects_in_catalog": pairs,
-        "pairs_after_altitude_filter": int(len(candidates)),
-        "coarse_pair_epochs": int(pair_epochs),
-        "refined_candidates": len(minima),
-        "co_located_excluded": len(co_located),
-        "co_located_norads": co_located[:50],
-        "conjunctions": len(results),
-        "alerts": sum(1 for c in results if c["alert"]),
-        "seconds": round(elapsed, 2),
-        "coarse_seconds": round(t_coarse, 2),
-        # Catalog pairs (asset vs every other object) resolved per second, prefilter included.
-        "pairs_per_sec": round(pairs / elapsed) if elapsed > 0 else None,
-        # Raw SGP4 pair-epoch throughput of the coarse pass.
-        "pair_epochs_per_sec": round(pair_epochs / t_coarse) if t_coarse > 0 else None,
+        **per[0],
+        "method": run["method"],
+        "coarse_pair_epochs": int(per[0]["pairs_after_altitude_filter"] * run["time_steps"]),
+        "kdtree_hits": run["kdtree_hits"],
+        "refined_candidates": run["refined_candidates"],
+        "seconds": run["seconds"],
+        "coarse_seconds": run["coarse_seconds"],
+        "seconds_split": run["seconds_split"],
     }
-    return results, stats
+    el = run["seconds"]
+    # Catalog pairs (asset vs every other object) resolved per second, prefilter included.
+    stats["pairs_per_sec"] = round(stats["objects_in_catalog"] / el) if el > 0 else None
+    # Pair-epochs covered per second by the coarse pass (every pair in the band, every step).
+    stats["pair_epochs_per_sec"] = round(stats["coarse_pair_epochs"] / run["coarse_seconds"]) if run["coarse_seconds"] > 0 else None
+    return results[0], stats
 
 
 def screen_paths(
@@ -401,48 +512,91 @@ def screen_paths(
 # --------------------------------------------------------------------------- throughput benchmark
 
 
-def benchmark(index: CatalogIndex, reference_norad: int = 25544, sample: int = 12, horizon_h: float = 24.0, seed: int = 42) -> dict:
-    """MEASURED time to screen one object against the full catalog, and an all-vs-all ESTIMATE from it.
+def all_vs_all_slice(index: CatalogIndex, slice_h: float = 1.0, screen_km: float = 10.0, t0: datetime | None = None,
+                     refine_sample: int = 300, seed: int = 42) -> dict:
+    """MEASURE one time slice of an all-vs-all screen (every object against every other), to extrapolate from.
 
-    Screens the reference object (ISS by default) plus `sample` objects drawn at random from the catalog
-    (so altitude shells are represented as in the catalog), each over `horizon_h` at 10 km, serially on one core.
-    All-vs-all estimate = catalog size × mean per-object time: our one-vs-catalog screen repeated for every
-    object, no pair sharing, no parallelism (an upper bound for this code; each pair is computed twice).
+    Per 60 s step: SGP4 for the whole catalog, cKDTree.query_pairs at the capture radius, straight-line closest
+    approach for every pair found. A random sample of the surviving candidates is refined at 1 s to time that step.
     """
+    t_start = time.perf_counter()
+    t0 = (t0 or datetime.now(timezone.utc)).replace(microsecond=0)
+    times = np.arange(0.0, slice_h * 3600.0, COARSE_STEP_S)
+    jd, fr = _jd(t0, times)
+    arr = SatrecArray(index.satrecs)
+    capture_km = screen_km + VREL_MAX_KMS * COARSE_STEP_S / 2
+    keep_km = screen_km + LINEAR_MARGIN_KM
+    tau_max = 0.6 * COARSE_STEP_S
+    pairs_found = 0
+    cands: list[np.ndarray] = []
+    t_prop = t_tree = 0.0
+    for b0 in range(0, len(times), KD_BLOCK_STEPS):
+        b1 = min(b0 + KD_BLOCK_STEPS, len(times))
+        tp = time.perf_counter()
+        e, r, v = arr.sgp4(jd[b0:b1], fr[b0:b1])
+        t_prop += time.perf_counter() - tp
+        tq = time.perf_counter()
+        for k in range(b1 - b0):
+            ok = e[:, k] == 0
+            pos = np.where(ok[:, None], r[:, k], FAR_KM)
+            pr = cKDTree(pos, balanced_tree=False, compact_nodes=False).query_pairs(capture_km, output_type="ndarray")
+            pairs_found += len(pr)
+            if not len(pr):
+                continue
+            a, b = pr[:, 0], pr[:, 1]
+            rel, vrel = r[b, k] - r[a, k], v[b, k] - v[a, k]
+            tau = np.clip(-np.einsum("ij,ij->i", rel, vrel) / np.maximum(np.einsum("ij,ij->i", vrel, vrel), 1e-12), -tau_max, tau_max)
+            near = np.linalg.norm(rel + vrel * tau[:, None], axis=1) < keep_km
+            cands.append(np.column_stack([a[near], b[near], times[b0 + k] + tau[near]]))
+        t_tree += time.perf_counter() - tq
+    C = np.vstack(cands) if cands else np.zeros((0, 3))
     rng = np.random.default_rng(seed)
-    picks = [index.pos[reference_norad]] if reference_norad in index.pos else []
-    others = [i for i in rng.permutation(len(index.entries)) if i not in picks]
-    runs = []
-    for i in picks + others:
-        if len(runs) >= sample + len(picks):
-            break
-        e = index.entries[i]
-        try:
-            _, st = screen(index, e, horizon_h=horizon_h, screen_km=10.0)
-        except ValueError:
-            continue  # cannot be propagated over the window (decayed elements); skip
-        runs.append({"norad": e["norad"], "name": e["name"], "perigee_km": e["perigee_km"], "apogee_km": e["apogee_km"],
-                     "seconds": st["seconds"], "pairs_after_altitude_filter": st["pairs_after_altitude_filter"], "pairs_per_sec": st["pairs_per_sec"]})
-    secs = np.array([r["seconds"] for r in runs])
-    n = len(index.entries)
-    mean_s = float(secs.mean())
-    ref = next((r for r in runs if r["norad"] == reference_norad), None)
+    pick = C[rng.choice(len(C), size=min(refine_sample, len(C)), replace=False)] if len(C) else C
+    tr = time.perf_counter()
+    for a, b, tc in pick:
+        _refine(index.satrecs[int(a)], index.satrecs[int(b)], t0, float(tc), 0.0, slice_h * 3600.0)
+    per_refine = (time.perf_counter() - tr) / max(len(pick), 1)
     return {
-        "measured_utc": _iso(datetime.now(timezone.utc)),
-        "catalog_objects": n,
-        "horizon_h": horizon_h,
-        "screen_km": 10.0,
-        "reference": ref,
-        "sample_runs": runs,
-        "per_object_seconds": {"mean": round(mean_s, 2), "median": round(float(np.median(secs)), 2), "min": round(float(secs.min()), 2), "max": round(float(secs.max()), 2), "n": len(runs)},
-        "pairs_per_sec_mean": round(float(np.mean([r["pairs_per_sec"] for r in runs]))),
-        "all_vs_all_estimate": {
-            "seconds": round(n * mean_s),
-            "hours": round(n * mean_s / 3600.0, 1),
-            "unique_pairs": n * (n - 1) // 2,
-            "basis": "est.: catalog size × mean measured per-object screen time (serial, one core, no pair sharing)",
-        },
+        "slice_h": slice_h, "time_steps": len(times), "objects": len(index.entries), "capture_radius_km": capture_km,
+        "kdtree_pairs_found": int(pairs_found), "refine_candidates": int(len(C)),
+        "seconds": {"propagation": round(t_prop, 2), "kdtree_and_filter": round(t_tree, 2), "per_refine": round(per_refine, 5),
+                    "total_measured": round(time.perf_counter() - t_start, 2)},
     }
+
+
+def benchmark(index: CatalogIndex, watch_entries: list[dict], reference_norad: int = 25544, horizon_h: float = 72.0,
+              slice_h: float = 1.0) -> dict:
+    """MEASURED screening throughput, serial on one core (sgp4's SatrecArray does not release the GIL):
+
+    1. one object (the ISS) against the full catalog over `horizon_h`;
+    2. the whole Sentinel watchlist against the full catalog over `horizon_h`, one shared pass (screen_many);
+    3. all-vs-all: a measured `slice_h` slice extrapolated linearly to `horizon_h` (an ESTIMATE; refinements
+       counted as they would scale: candidates in the slice × horizon/slice × measured time per refinement).
+    """
+    t0 = datetime.now(timezone.utc).replace(microsecond=0)
+    out: dict = {"measured_utc": _iso(t0), "catalog_objects": len(index.entries), "horizon_h": horizon_h, "screen_km": 10.0}
+    ref_i = index.pos.get(reference_norad)
+    if ref_i is not None:
+        e = index.entries[ref_i]
+        res, st = screen(index, e, horizon_h=horizon_h, screen_km=10.0, t0=t0)
+        out["reference"] = {"norad": e["norad"], "name": e["name"], "seconds": st["seconds"], "seconds_split": st["seconds_split"],
+                            "pairs_after_altitude_filter": st["pairs_after_altitude_filter"], "pairs_per_sec": st["pairs_per_sec"],
+                            "conjunctions": len(res)}
+    if watch_entries:
+        res, per, run = screen_many(index, watch_entries, horizon_h=horizon_h, screen_km=10.0, t0=t0)
+        out["watchlist"] = {"objects": len(watch_entries), "seconds": run["seconds"], "seconds_split": run["seconds_split"],
+                            "objects_propagated": run["objects_propagated"], "pairs_checked": run["pairs_checked"],
+                            "conjunctions": sum(len(r) for r in res),
+                            "seconds_per_object": round(run["seconds"] / len(watch_entries), 2)}
+    sl = all_vs_all_slice(index, slice_h=slice_h, t0=t0)
+    scale = horizon_h / slice_h
+    est = (sl["seconds"]["propagation"] + sl["seconds"]["kdtree_and_filter"]) * scale + sl["refine_candidates"] * scale * sl["seconds"]["per_refine"]
+    n = len(index.entries)
+    out["all_vs_all_estimate"] = {
+        "seconds": round(est), "hours": round(est / 3600.0, 2), "unique_pairs": n * (n - 1) // 2, "slice": sl,
+        "basis": f"est.: measured {slice_h:g} h slice of an all-vs-all cKDTree screen (query_pairs per 60 s step), scaled to {horizon_h:g} h; serial, one core",
+    }
+    return out
 
 
 # --------------------------------------------------------------------------- maneuver
@@ -529,13 +683,33 @@ def _ndot_half(tle1: str) -> float | None:
         return None
 
 
-def reentry(entries: list[dict], now: datetime | None = None, limit: int = 25) -> list[dict]:
+def _forecast_mean(days: list[dict], start: datetime, span_days: float) -> float | None:
+    """Mean forecast F10.7 over [start, start + span] from the 27-day outlook; beyond its last day, persistence
+    of the outlook's own mean (ASSUMED)."""
+    future = [d for d in days if d["date"] >= start.date().isoformat()]
+    if not future:
+        return None
+    n = max(1, int(math.ceil(span_days)))
+    vals = [d["f107"] for d in future[:n]]
+    if n > len(vals):
+        tail = sum(d["f107"] for d in future) / len(future)
+        vals += [tail] * (n - len(vals))
+    return sum(vals) / len(vals)
+
+
+def reentry(entries: list[dict], now: datetime | None = None, limit: int = 25, solar: dict | None = None) -> list[dict]:
     """HEURISTIC (est.): days until mean motion reaches ~16.4 rev/day at the TLE's current decay rate.
 
-    est_days = (16.4 - n) / (dn/dt) - (days since epoch), with dn/dt = 2 × TLE ndot/2 term.
+    est_days_raw = (16.4 - n) / (dn/dt) - (days since epoch), with dn/dt = 2 × TLE ndot/2 term.
     Decay accelerates as perigee drops, so this tends to OVERestimate the remaining time.
+
+    Space weather (est.), when `solar` = {"f107_recent": observed 27-day mean, "days": NOAA 27-day outlook rows}
+    is given: the TLE's decay rate reflects recent solar activity, so the time is scaled by
+    (F10.7 recent / F10.7 forecast mean over the decay window)^SW_DENSITY_EXPONENT (two fixed-point passes).
     """
     now = now or datetime.now(timezone.utc)
+    f_recent = (solar or {}).get("f107_recent")
+    outlook = (solar or {}).get("days") or []
     out = []
     for e in entries:
         if e["perigee_km"] > REENTRY_MAX_PERIGEE_KM:
@@ -549,7 +723,15 @@ def reentry(entries: list[dict], now: datetime | None = None, limit: int = 25) -
             continue
         age_d = (now - datetime.fromisoformat(e["epoch"].replace("Z", "+00:00"))).total_seconds() / 86400.0
         raw = (REENTRY_N_REVDAY - n) / (2 * half) - age_d
-        est = max(0.0, raw)
+        est_raw = max(0.0, raw)
+        est, factor, f_fc = est_raw, None, None
+        if f_recent and outlook and est_raw > 0:
+            for _ in range(2):
+                f_fc = _forecast_mean(outlook, now, max(est, 1.0))
+                if not f_fc:
+                    break
+                factor = min(max((f_recent / f_fc) ** SW_DENSITY_EXPONENT, SW_FACTOR_RANGE[0]), SW_FACTOR_RANGE[1])
+                est = est_raw * factor
         if est > REENTRY_MAX_DAYS:
             continue
         out.append(
@@ -560,11 +742,17 @@ def reentry(entries: list[dict], now: datetime | None = None, limit: int = 25) -
                 "perigee_km": e["perigee_km"],
                 "apogee_km": e["apogee_km"],
                 "est_days": round(est, 1),
+                "est_days_raw": round(est_raw, 1),
+                "sw_factor": round(factor, 3) if factor is not None else None,
+                "f107_recent": f_recent,
+                "f107_forecast_mean": round(f_fc, 1) if f_fc else None,
                 "risk": "high" if est < 7 else "medium" if est < 30 else "low",
                 "tle_age_days": round(age_d, 1),
                 # Estimated date already passed since the TLE epoch: imminent or already re-entered.
                 "overdue": raw < 0,
-                "basis": "heuristic: mean-motion derivative (est.)",
+                "basis": ("heuristic: mean-motion derivative, scaled by the NOAA SWPC 27-day F10.7 outlook (est.)" if factor is not None
+                          else "heuristic: mean-motion derivative (est.); already overdue, nothing to scale" if est_raw == 0 and f_recent and outlook
+                          else "heuristic: mean-motion derivative (est.); space-weather outlook unavailable"),
             }
         )
     out.sort(key=lambda r: r["est_days"])

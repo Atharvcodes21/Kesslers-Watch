@@ -3,6 +3,8 @@
 Run `python ml.py train` to (re)build backend/models/ from backend/data/kelvins/ (needs pandas, which
 only training uses; the API server imports just numpy, scikit-learn and joblib).
 Run `python ml.py throughput` to measure screening throughput on the live catalog (saved to metrics.json).
+Run `python ml.py decision-kpis` to recompute the Go / No-Go decision-level KPIs on the ESA test sets without
+retraining (saved to metrics.json kpis.decision_levels; `train` computes them too).
 
 Task (Kelvins): each event_id is a time series of Conjunction Data Messages (CDMs). The target is the
 `risk` (log10 collision probability) in the event's LAST CDM. Inputs may only use CDMs with
@@ -428,14 +430,11 @@ def _brief(s: dict) -> dict:
     return {k: s[k] for k in keys}
 
 
-def train(data_dir: Path = DATA_DIR) -> dict:
-    import joblib
+def prepare(data_dir: Path = DATA_DIR) -> dict:
+    """Load the Kelvins CSVs, build one row per event and make the fixed-seed 60/20/20 split by event."""
     import pandas as pd
-    import sklearn
     from sklearn.model_selection import train_test_split
 
-    t0 = time.time()
-    MODEL_DIR.mkdir(parents=True, exist_ok=True)
     print("loading CSVs…", flush=True)
     tr = pd.read_csv(data_dir / "train_data" / "train_data.csv", low_memory=False)
     te = pd.read_csv(data_dir / "test_data.csv", low_memory=False)
@@ -462,6 +461,22 @@ def train(data_dir: Path = DATA_DIR) -> dict:
     y_te_s = pv.set_index("event_id")["true_risk"]
     y_te = y_te_s.reindex(feats_te.index).to_numpy(float)
     assert not np.isnan(y_te).any() and te["time_to_tca"].min() >= MIN_TCA_DAYS
+    return {"tr": tr, "te": te, "feats_all": feats_all, "latest_all": latest_all, "y_final_all": y_final_all,
+            "n_events_total": n_events_total, "tr_ids": tr_ids, "va_ids": va_ids, "ho_ids": ho_ids,
+            "feats_te": feats_te, "latest_te": latest_te, "y_te": y_te, "y_te_s": y_te_s}
+
+
+def train(data_dir: Path = DATA_DIR) -> dict:
+    import joblib
+    import sklearn
+
+    t0 = time.time()
+    MODEL_DIR.mkdir(parents=True, exist_ok=True)
+    P = prepare(data_dir)
+    tr, te = P["tr"], P["te"]
+    feats_all, latest_all, y_final_all, n_events_total = P["feats_all"], P["latest_all"], P["y_final_all"], P["n_events_total"]
+    tr_ids, va_ids, ho_ids = P["tr_ids"], P["va_ids"], P["ho_ids"]
+    feats_te, latest_te, y_te, y_te_s = P["feats_te"], P["latest_te"], P["y_te"], P["y_te_s"]
 
     full_names = list(feats_all.columns)
     full_cat = ["mission_id", "object_type"]
@@ -586,6 +601,8 @@ def train(data_dir: Path = DATA_DIR) -> dict:
         "live": importance(live, data["holdout"]["X"][live_key], data["holdout"]["y"], top=len(live["names"])),
     }
 
+    decision_levels = decision_level_kpis(_eval_sets(P), live)
+
     sizes = {}
     for name, m in (("full", full), ("live", live)):
         joblib.dump(m, MODEL_DIR / f"{name}.joblib", compress=3)
@@ -636,6 +653,7 @@ def train(data_dir: Path = DATA_DIR) -> dict:
                                 "tried": "class_weight='balanced' trees, then isotonic recalibration on unweighted held-out folds",
                                 "selection": "lower validation Brier score (calibration error also shown)", "by_feature_set": imbalance},
             "radial_feature": radial_cmp,
+            "decision_levels": decision_levels,
             # Throughput is measured by `python ml.py throughput` on the live catalog; kept across retrains.
             "throughput": previous.get("kpis", {}).get("throughput"),
         },
@@ -649,19 +667,114 @@ def train(data_dir: Path = DATA_DIR) -> dict:
     return metrics
 
 
+def _eval_sets(P: dict) -> dict:
+    """(features, latest risk, final risk) for the held-out events and ESA's official test set."""
+    ho = P["ho_ids"]
+    return {
+        "holdout": (P["feats_all"].loc[ho], P["latest_all"].loc[ho].to_numpy(float), P["y_final_all"].loc[ho].to_numpy(float)),
+        "official_test": (P["feats_te"], P["latest_te"].to_numpy(float), P["y_te"]),
+    }
+
+
+def _confusion(y_high: np.ndarray, pred: np.ndarray) -> dict:
+    tp, fp = int((pred & y_high).sum()), int((pred & ~y_high).sum())
+    fn, tn = int((~pred & y_high).sum()), int((~pred & ~y_high).sum())
+    return {"recall": tp / (tp + fn) if tp + fn else None, "false_alert_rate": fp / (fp + tn) if fp + tn else None,
+            "precision": tp / (tp + fp) if tp + fp else None, "alerts": tp + fp, "tp": tp, "fp": fp, "fn": fn, "tn": tn}
+
+
+def decision_level_kpis(sets: dict, live: dict) -> dict:
+    """Recall / false-alert rate of the two-stage Go / No-Go rule (decision.triggers) on ESA events.
+
+    Mapping (ESA CDM → live record): Pc = 10^risk of the latest CDM ≥ 2 d before TCA, miss = miss_distance; AI inputs
+    as in LIVE_FEATURE_MAP. Truth: final risk ≥ 1e-6. ESA CDMs carry no TLE age, so the stale-data rule never fires.
+    "WATCH or above" = any GO or WATCH trigger (GO also needs a valid avoidance plan, which cannot be checked on
+    historical data; without one, GO becomes WATCH, so the count is the same).
+    """
+    import decision
+
+    cfg = {**decision.CONFIG, "ai_p_high_threshold": float(live["threshold"])}
+    out: dict = {
+        "method": ("Pc = 10^risk of the latest ESA CDM at least 2 days before TCA; miss = its miss_distance; AI = live model on the "
+                   "same CDM. Truth: final risk ≥ 1e-6. ESA CDMs carry no TLE age, so the stale-data rule never fires. GO also needs "
+                   "a valid avoidance plan, which cannot be checked on historical data; without one GO becomes WATCH, so "
+                   "'WATCH or above' counts every GO or WATCH trigger."),
+        "thresholds": {k: cfg[k] for k in ("ai_p_high_threshold", "watch_pc", "watch_ai_min_pc", "go_pc", "go_ai_final_risk")},
+        "levels": {
+            "early_flag": "AI early flag: P(high-risk) ≥ the 95%-recall threshold (tag only)",
+            "watch_or_above": "WATCH or above under the two-stage rule",
+            "pc_watch_only": "For comparison: Pc ≥ 1e-5 alone (no AI)",
+            "previous_rule": "For comparison: the previous rule (AI flag alone, or Pc / AI final risk ≥ 1e-5, raised WATCH)",
+        },
+        "by_set": {},
+    }
+    for ds, (feats, latest, y) in sets.items():
+        X = live_matrix(feats, live["names"]).to_numpy(float)
+        pred = predict_family(live, X, latest)
+        pc = 10.0 ** np.asarray(latest, float)
+        miss_km = feats["miss_distance"].to_numpy(float) / 1000.0
+        ai_risk = 10.0 ** pred["risk"]
+        y_high = np.asarray(y, float) >= HIGH_RISK
+        n = len(y)
+        flag = np.zeros(n, bool)
+        woa = np.zeros(n, bool)
+        go_ai_only = np.zeros(n, bool)
+        by_trigger = {"pc": 0, "ai_backed_by_pc": 0, "go_threshold": 0}
+        for i in range(n):
+            t = decision.triggers(float(pc[i]), float(pred["p"][i]), float(ai_risk[i]), None, float(miss_km[i]), cfg)
+            flag[i] = t["ai_flag"]
+            woa[i] = bool(t["go"] or t["watch"])
+            go_ai_only[i] = bool(t["go"]) and pc[i] < cfg["go_pc"]
+            if t["go"]:
+                by_trigger["go_threshold"] += 1
+            elif any(r.startswith("Pc ") for r in t["watch"]):
+                by_trigger["pc"] += 1
+            elif t["watch"]:
+                by_trigger["ai_backed_by_pc"] += 1
+        previous = flag | (pc >= 1e-5) | (ai_risk >= 1e-5)
+        out["by_set"][ds] = {
+            "n": n, "n_high_risk": int(y_high.sum()),
+            "early_flag": _confusion(y_high, flag),
+            "watch_or_above": _confusion(y_high, woa),
+            "pc_watch_only": _confusion(y_high, pc >= cfg["watch_pc"]),
+            "previous_rule": _confusion(y_high, previous),
+            "early_flag_only": int((flag & ~woa).sum()),
+            "watch_or_above_by_trigger": by_trigger,
+            "go_from_ai_only": int(go_ai_only.sum()),
+        }
+    return out
+
+
+def measure_decision_kpis() -> dict:
+    """Recompute kpis.decision_levels from the saved live model (no retraining) and save it in metrics.json."""
+    import joblib
+
+    live = joblib.load(MODEL_DIR / "live.joblib")
+    result = decision_level_kpis(_eval_sets(prepare()), live)
+    m = json.loads(METRICS_PATH.read_text(encoding="utf-8")) if METRICS_PATH.exists() else {}
+    m.setdefault("kpis", {})["decision_levels"] = result
+    METRICS_PATH.write_text(json.dumps(_clean(m), indent=2), encoding="utf-8")
+    print(json.dumps(_clean(result["by_set"]), indent=2), flush=True)
+    return result
+
+
 def measure_throughput() -> dict:
-    """Screen the ISS and a random catalog sample over 24 h (risk.benchmark) and save the result in metrics.json."""
+    """Screen the ISS, the Sentinel watchlist and an all-vs-all slice over 72 h (risk.benchmark); save in metrics.json."""
     import orbit
     import risk
+    import watchlist
 
     entries, meta = orbit.build_catalog()
-    print(f"catalog: {len(entries)} objects from {meta.get('source')}; screening a sample over 24 h…", flush=True)
-    result = risk.benchmark(risk.build_index(entries))
+    by = {e["norad"]: e for e in entries}
+    watchlist.sync_defaults(by)
+    watched, _ = watchlist.resolve(by)
+    print(f"catalog: {len(entries)} objects from {meta.get('source')}; watchlist {len(watched)}; screening over 72 h…", flush=True)
+    result = risk.benchmark(risk.build_index(entries), [w["entry"] for w in watched])
     result["catalog_source"] = meta.get("source")
     m = json.loads(METRICS_PATH.read_text(encoding="utf-8")) if METRICS_PATH.exists() else {}
     m.setdefault("kpis", {})["throughput"] = result
     METRICS_PATH.write_text(json.dumps(_clean(m), indent=2), encoding="utf-8")
-    print(json.dumps({k: result[k] for k in ("reference", "per_object_seconds", "all_vs_all_estimate")}, indent=2), flush=True)
+    print(json.dumps({k: result.get(k) for k in ("reference", "watchlist", "all_vs_all_estimate")}, indent=2), flush=True)
     return result
 
 
@@ -809,5 +922,7 @@ if __name__ == "__main__":
         train()
     elif cmd == "throughput":
         measure_throughput()
+    elif cmd == "decision-kpis":
+        measure_decision_kpis()
     else:
-        print("usage: python ml.py train | throughput")
+        print("usage: python ml.py train | throughput | decision-kpis")

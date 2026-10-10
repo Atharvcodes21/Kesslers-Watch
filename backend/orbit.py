@@ -1,7 +1,7 @@
 """Catalog sources (Space-Track primary, CelesTrak fallback), N2YO client and orbit helpers.
 
-Secrets come from backend/.env (SPACETRACK_USER, SPACETRACK_PASS, N2YO_API_KEY). They are never
-logged, never put in error messages and never returned to the frontend.
+Secrets come from backend/.env (SPACETRACK_USER, SPACETRACK_PASS, N2YO_API_KEY, TELEGRAM_BOT_TOKEN,
+TELEGRAM_CHAT_ID). They are never logged, never put in error messages and never returned to the frontend.
 """
 from __future__ import annotations
 
@@ -176,7 +176,13 @@ ST_GP_ALL = (
 ST_GP_ONE = f"{ST_BASE}/basicspacedata/query/class/gp/norad_cat_id/{{norad}}/predicates/{_ST_FIELDS}/format/json"
 
 ST_CACHE = CACHE_DIR / "spacetrack_gp.json"
-ST_REFRESH_S = 4 * 3600  # docs: GP at most once per hour; we refresh every 4 h
+ST_REFRESH_S = 3600  # docs: GP at most once per hour; Sentinel refreshes on that cadence, never faster
+# SATCAT, one query per country (Sentinel's default watchlist), cached a day.
+ST_SATCAT_COUNTRY = (
+    f"{ST_BASE}/basicspacedata/query/class/satcat/COUNTRY/{{country}}/OBJECT_TYPE/PAYLOAD/DECAY/null-val/CURRENT/Y"
+    "/predicates/NORAD_CAT_ID,SATNAME,COUNTRY,OBJECT_TYPE,PERIGEE,APOGEE,LAUNCH/orderby/NORAD_CAT_ID%20asc/format/json"
+)
+SATCAT_TTL_S = 24 * 3600
 ST_FAIL_COOLDOWN_S = 15 * 60
 ST_SESSION_S = 90 * 60
 
@@ -289,6 +295,52 @@ def spacetrack_catalog() -> tuple[list[dict], float] | None:
         log.warning("Space-Track: using stale cache from %s", datetime.fromtimestamp(cached[0], timezone.utc))
         return cached[1], cached[0]
     return None
+
+
+def spacetrack_satcat_payloads(country: str) -> tuple[list[dict], str] | None:
+    """On-orbit PAYLOAD rows of one SATCAT COUNTRY code (e.g. IND). Cached 24 h on disk; stale cache on failure.
+
+    Returns (rows, fetched_utc) or None when neither Space-Track nor a cache is available.
+    """
+    path = CACHE_DIR / f"spacetrack_satcat_{country.lower()}.json"
+    cached = None
+    if path.exists():
+        try:
+            blob = json.loads(path.read_text(encoding="utf-8"))
+            cached = (float(blob["fetched_at"]), blob["rows"])
+        except Exception:
+            cached = None
+    if cached and time.time() - cached[0] < SATCAT_TTL_S:
+        return cached[1], _utc(cached[0])
+    if SPACETRACK.can_try():
+        try:
+            rows = SPACETRACK.query(ST_SATCAT_COUNTRY.format(country=country))
+            now = time.time()
+            CACHE_DIR.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps({"fetched_at": now, "rows": rows}), encoding="utf-8")
+            return rows, _utc(now)
+        except (SourceError, RateLimited) as e:
+            SPACETRACK.fail(str(e))
+    return (cached[1], _utc(cached[0])) if cached else None
+
+
+def celestrak_active_norads() -> set[int] | None:
+    """NORAD IDs in CelesTrak's "active" group (cached 2 h like every CelesTrak group), or None if unavailable."""
+    with httpx.Client(timeout=30, headers={"User-Agent": USER_AGENT}) as client:
+        text = _celestrak_group("active", client)
+    if not text:
+        return None
+    out = set()
+    for _, l1, l2 in _parse_tle_text(text):
+        try:
+            out.add(int(Satrec.twoline2rv(l1, l2).satnum))
+        except Exception:
+            continue
+    return out
+
+
+def _utc(ts: float) -> str:
+    return datetime.fromtimestamp(ts, timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
 
 
 # --------------------------------------------------------------------------- CelesTrak fallback
@@ -599,6 +651,10 @@ def n2yo_position(norad: int, lat: float = 0.0, lon: float = 0.0) -> dict:
 # --------------------------------------------------------------------------- space weather (NOAA SWPC)
 
 SWPC_F107 = "https://services.swpc.noaa.gov/json/f107_cm_flux.json"
+SWPC_27DAY = "https://services.swpc.noaa.gov/text/27-day-outlook.txt"
+OUTLOOK_CACHE = CACHE_DIR / "swpc_27day.json"
+OUTLOOK_TTL_S = 6 * 3600  # issued weekly
+_outlook_mem: tuple[float, dict] | None = None
 SWPC_KP = "https://services.swpc.noaa.gov/products/noaa-planetary-k-index.json"
 SW_CACHE = CACHE_DIR / "spaceweather.json"
 SW_TTL_S = 30 * 60
@@ -633,7 +689,14 @@ def _fetch_space_weather() -> dict:
     if not flux or not kp:
         raise ValueError("empty SWPC response")
     a_last = [a for _, _, a in kp[-8:] if a is not None]
+    # Observed daily flux over the last 27 days (several readings per day: one value per day, the last of the day).
+    by_day: dict[str, float] = {}
+    for r in flux:
+        by_day[r["time_tag"][:10]] = float(r["flux"])
+    recent = [by_day[d] for d in sorted(by_day)[-27:]]
     return {
+        "f107_27d_mean": round(sum(recent) / len(recent), 1) if recent else None,
+        "f107_27d_days": len(recent),
         "f107": float(flux[-1]["flux"]),
         "f107_time_utc": flux[-1]["time_tag"] + "Z",
         "kp": kp[-1][1],
@@ -643,6 +706,51 @@ def _fetch_space_weather() -> dict:
         "ap_basis": "mean of last 8 three-hourly ap values (24 h)",
         "source": "NOAA SWPC",
     }
+
+
+def _parse_27day(text: str) -> dict:
+    """NOAA SWPC 27-day outlook table: one row per day `YYYY Mon DD  flux  Ap  Kp`."""
+    issued = None
+    days = []
+    for ln in text.splitlines():
+        if ln.startswith(":Issued:"):
+            issued = ln.split(":Issued:", 1)[1].strip()
+        parts = ln.split()
+        if len(parts) >= 6 and parts[0].isdigit() and len(parts[0]) == 4:
+            try:
+                d = datetime.strptime(" ".join(parts[:3]), "%Y %b %d").date()
+                days.append({"date": d.isoformat(), "f107": float(parts[3]), "ap": float(parts[4]), "kp_max": float(parts[5])})
+            except ValueError:
+                continue
+    if not days:
+        raise ValueError("no rows in the 27-day outlook")
+    return {"issued": issued, "days": days, "source": "NOAA SWPC 27-day outlook"}
+
+
+def solar_outlook() -> dict:
+    """NOAA SWPC 27-day forecast of F10.7 / Ap (issued weekly). Cached 6 h; stale cache on failure."""
+    global _outlook_mem
+    if _outlook_mem and time.time() - _outlook_mem[0] < OUTLOOK_TTL_S:
+        return {**_outlook_mem[1], "stale": False}
+    try:
+        with httpx.Client(timeout=20, headers={"User-Agent": USER_AGENT}) as c:
+            r = c.get(SWPC_27DAY)
+        r.raise_for_status()
+        data = _parse_27day(r.text)
+        now = time.time()
+        _outlook_mem = (now, data)
+        CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        OUTLOOK_CACHE.write_text(json.dumps({"fetched_at": now, "data": data}), encoding="utf-8")
+        return {**data, "stale": False}
+    except Exception as e:
+        log.warning("SWPC 27-day outlook fetch failed: %s", type(e).__name__)
+        if _outlook_mem:
+            return {**_outlook_mem[1], "stale": True}
+        if OUTLOOK_CACHE.exists():
+            blob = json.loads(OUTLOOK_CACHE.read_text(encoding="utf-8"))
+            _outlook_mem = (float(blob["fetched_at"]), blob["data"])
+            return {**blob["data"], "stale": True}
+        raise SourceError("NOAA SWPC 27-day outlook is unavailable.") from None
 
 
 def space_weather() -> dict:
