@@ -25,6 +25,7 @@ import ml
 import orbit
 import risk
 import sentinel
+import telegram_bot
 import watchlist
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
@@ -37,7 +38,11 @@ async def lifespan(_app: FastAPI):
     # Sentinel: hourly watchlist screening in a background thread (SENTINEL_DISABLED=1 turns it off).
     if os.environ.get("SENTINEL_DISABLED") != "1":
         sentinel.SENTINEL.start(sentinel.Hooks(refresh_catalog=refresh_catalog, get_index=get_index))
+    # Interactive Telegram bot command listener
+    if os.environ.get("TELEGRAM_BOT_DISABLED") != "1" and telegram_bot._token():
+        telegram_bot.start_bot_thread()
     yield
+    telegram_bot.stop_bot_thread()
     sentinel.SENTINEL.stop()
     sentinel.REPLAY.stop()
 
@@ -120,6 +125,17 @@ def resolve_object(norad: int) -> dict:
         raise HTTPException(404, f"No element set found for NORAD {norad}.") from None
     except orbit.SourceError as e:
         raise HTTPException(502, f"Lookup failed: {e}") from None
+
+
+@app.get("/")
+def root() -> dict:
+    return {
+        "name": "KesslerWatch API",
+        "status": "online",
+        "docs_url": "/docs",
+        "status_url": "/status",
+        "frontend_url": "http://localhost:3000",
+    }
 
 
 @app.get("/catalog")
